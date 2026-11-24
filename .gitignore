@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# C/C++/CUDA/Fortran build artifacts
+*.o
+*.mod
+*.a
+*.so
+*.dylib
+*.ptx
+*.cubin
+work_opt/analysis/verify_fortran_oracle
+work_opt/analysis/verify_math_and_kernels
+work_opt/analysis/msg_*.pe*
+work_opt/nicam_mp/bin/*
+work_opt/nicam_mp/lib/*
+work_opt/nicam_mp/workspace/*
+
+# Profiling traces
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# Local manuscript / paper drafts (kept local, not pushed)
+paper/
+
+# LaTeX build artifacts & packaged zips
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz

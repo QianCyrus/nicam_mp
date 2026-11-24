@@ -1,0 +1,29 @@
+#!/bin/bash -e
+
+VERSION=25.9
+
+module load nvidia/${VERSION}
+module load nv-hpcx
+module load netcdf
+module load netcdf-fortran
+module load hdf5
+
+export ENABLE_OPENMP=F
+export ENABLE_OPENACC=T
+export ENABLE_NETCDF=T
+
+export NEW_BINDIR=./bin_gpu
+export NICAM_SYS=Miyabi-G
+
+export MAKELOG="make.log"
+
+MY_LIBPATH=/work/opt/local/aarch64/apps/nvidia/${VERSION}/netcdf-fortran/4.6.1/lib
+MY_INCLUDEPATH=/work/opt/local/aarch64/apps/nvidia/${VERSION}/netcdf-fortran/4.6.1/include
+export NETCDF_LIBS="-L${MY_LIBPATH} -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lm -lz"
+export NETCDF_INCLUDE="-I${MY_INCLUDEPATH}"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${MY_LIBPATH}"
+
+make allclean
+make -j 8 &> ${MAKELOG}   # capped: unbounded -j gets killed on Miyabi login nodes
+rm -rf ${NEW_BINDIR}
+cp -rf ./bin ${NEW_BINDIR}

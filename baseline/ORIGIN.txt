@@ -1,0 +1,15 @@
+NICAM NSW6 mini-app 原始源码基线
+
+来源主机　Miyabi-G
+原始交付包　/work/jh260050/v57014/nicam_mp.tar.gz
+原始包 SHA-256　278659af33a9f4d9bd5e7d0a3cad3e6643270ff93d995bb5e556a7c38c28e54f
+历史 Fortran 基线目录　/work/jh260050/v57014/nicam_mp_extracted/nicam_mp
+
+nicam_mp/ 从交付包直接解出，保留原始 Fortran、构建脚本、运行配置、工具和文档。
+SHA256SUMS 记录 71 个文件的散列，已同时对照历史 Fortran 基线与本地恢复副本。
+nicam_mp/dataset 是指向 Miyabi 现有参考数据的链接。在集群上可用，本地仅保留链接。
+
+本地基线　/Users/aniya/ANZIAM_2027/baseline/nicam_mp
+集群基线　/work/jh260050/v57014/ANZIAM_2027/baseline/nicam_mp
+集群优化版　/work/jh260050/v57014/NICAM-miniapp-triton-aot
+优化版提交　2cd175128c61f6ee5322b13d35e4d3abb82e6ed3

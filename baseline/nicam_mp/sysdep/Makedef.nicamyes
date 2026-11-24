@@ -1,0 +1,63 @@
+#
+# ------ FOR heath and kohaku in YES/JAMSTEC -----
+#
+
+FFLAGS_FAST  = -fpp -O3 -m64 -xHost -ip            \
+               -assume byterecl -convert big_endian \
+               -ftz -fp-model precise -pc 80        \
+               -mcmodel=medium -shared-intel        \
+               -heap-arrays -fno-alias
+#  4th line -> -static-intel ? (memo by C.Kodama)
+
+FFLAGS_DEBUG = -fpp -O0 -m64                       \
+               -assume byterecl -convert big_endian \
+               -fp-model precise -pc 80             \
+               -check all -warn all -g -traceback   \
+               -mcmodel=medium -shared-intel        \
+               -heap-arrays -fno-alias
+
+FC     = mpif90
+#FFLAGS = $(FFLAGS_FAST)
+FFLAGS = $(FFLAGS_DEBUG)
+
+CC     = mpicc
+CFLAGS_FAST = -O3 -m64 -mcmodel=medium -std=c99
+#CFLAGS = -O3 -m64 -mcmodel=medium
+
+##### Special Options #####
+
+ifeq ($(ENABLE_OPENMP),T)
+	FFLAGS += -openmp -openmp-report
+endif
+
+ifeq ($(ENABLE_NETCDF),T)
+	NETCDF_INCLUDE ?= -I/opt/tools/netcdf/intel-c4.6.2-f4.4.5/include
+	NETCDF_LIBS    ?= -L/opt/tools/netcdf/intel-c4.6.2-f4.4.5/lib -lnetcdff -lnetcdf -lhdf5_hl -lhdf5
+#       Note: before execution, type "module load netcdf/intel-c4.6.2-f4.4.5"
+
+#	NETCDF_INCLUDE ?= -I/opt/tools/netcdf-fortran/4.4.5/include
+#	NETCDF_LIBS    ?= -L/opt/tools/netcdf-fortran/4.4.5/lib -lnetcdff -L/opt/tools/netcdf-c/4.6.2/lib -lnetcdf -lhdf5_hl -lhdf5 -lsz -lz -lcurl -lm
+#       Note: before execution, type "module load netcdf/intel"
+	FFLAGS += $(NETCDF_INCLUDE)
+endif
+
+ifeq ($(USE_NETCDF3),T)
+	FFLAGS += -DNETCDF3
+	CFLAGS += -DNETCDF3
+endif
+
+###########################
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?= $(BUILDDIR)
+
+LD     = $(FC)
+LFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

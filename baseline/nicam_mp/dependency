@@ -1,0 +1,19 @@
+mod_adm.o: mod_adm.f90 mod_precision.o mod_stdio.o
+mod_bndcnd.o: mod_bndcnd.f90 mod_adm.o mod_cnst.o mod_precision.o mod_stdio.o
+mod_ch_includes.o: mod_ch_includes.f90 mod_precision.o mod_prof.o mod_stdio.o
+mod_cnst.o: mod_cnst.f90 mod_adm.o mod_precision.o mod_prof.o mod_stdio.o
+mod_cnvvar.o: mod_cnvvar.f90 mod_adm.o mod_bndcnd.o mod_grd.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o mod_thrmdyn.o
+mod_grd.o: mod_grd.f90 mod_adm.o mod_cnst.o mod_precision.o mod_stdio.o
+mod_isotope.o: mod_isotope.f90 mod_adm.o mod_cnst.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o
+mod_misc.o: mod_misc.f90 mod_cnst.o mod_precision.o mod_prof.o mod_stdio.o
+mod_mp_driver.o: mod_mp_driver.f90 mod_adm.o mod_cnst.o mod_cnvvar.o mod_mp_nsw6.o mod_precision.o mod_prof.o mod_runconf.o mod_satadjust.o mod_stdio.o
+mod_mp_nsw6.o: mod_mp_nsw6.f90 mod_adm.o mod_cnst.o mod_isotope.o mod_misc.o mod_precip_transport.o mod_precision.o mod_prof.o mod_runconf.o mod_satadjust.o mod_stdio.o mod_thrmdyn.o
+mod_precip_transport.o: mod_precip_transport.f90 mod_adm.o mod_cnst.o mod_cnvvar.o mod_grd.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o mod_thrmdyn.o mod_vadv1d.o
+mod_precision.o: mod_precision.f90
+mod_prof.o: mod_prof.f90 mod_adm.o mod_precision.o mod_stdio.o
+mod_runconf.o: mod_runconf.f90 mod_adm.o mod_ch_includes.o mod_cnst.o mod_precision.o mod_prof.o mod_stdio.o
+mod_satadjust.o: mod_satadjust.f90 mod_adm.o mod_cnst.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o mod_thrmdyn.o
+mod_stdio.o: mod_stdio.f90
+mod_thrmdyn.o: mod_thrmdyn.f90 mod_cnst.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o
+mod_vadv1d.o: mod_vadv1d.f90 mod_adm.o mod_grd.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o
+prg_mp_miniapp.o: prg_mp_miniapp.f90 mod_adm.o mod_bndcnd.o mod_cnst.o mod_grd.o mod_mp_driver.o mod_vadv1d.o mod_precision.o mod_prof.o mod_runconf.o mod_stdio.o

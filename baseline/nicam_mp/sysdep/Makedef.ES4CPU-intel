@@ -1,0 +1,82 @@
+################################################################################
+#
+# ------ For Linux64 & intel fortran&C & intel mpi -----
+#
+################################################################################
+
+#### For ES4 users
+#### please do "module load Intel_oneAPI/2021.1.1/all IntelMPI/2021.1.1 NetCDF4_intel/all"
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpiifort
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?=         $(BUILDDIR)
+
+FFLAGS_FAST  = -fpp -m64 -O3 -march=core-avx2                      \
+               -assume byterecl -convert big_endian \
+               -fp-model source -align array64byte -mcmodel=medium
+
+FFLAGS_QUICKDEBUG = -traceback -fpe0 -CB -CU
+
+FFLAGS_DEBUG = -fpp -m64 -O0                             \
+               -assume byterecl -convert big_endian      \
+               -fpe0 -fp-model source -align array64byte \
+               -check all -warn all -g -traceback
+
+# Note: An option -heap-arrays is not added because of the bug of the old version of Intel compiler.
+#       If you meet the error caused by the stack memory, please try to use this option.
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpiicc
+
+#CFLAGS_FAST  = -O3 -m64 -std=c99 -xHost -ip -ftz -mcmodel=medium -shared-intel
+CFLAGS_FAST  = -O3 -m64 -std=c99  -march=core-avx2 -ip -ftz -mcmodel=medium -shared-intel
+CFLAGS_DEBUG = -O0 -m64 -std=c99
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -openmp -no-heap-arrays
+
+FFLAGS_SYSDEPEND = -DLOWMPITAG
+CFLAGS_SYSDEPEND = -DLOWMPITAG
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Settings are inquired by using nf-config & nc-config command (see ~/Mkinclude)
+# Or, please set environment variable
+NETCDF_INCLUDE ?= -I/opt/share/NetCDF4_intel/netcdf-fortran/4.5.2/include  -I/opt/share/NetCDF4_intel/netcdf-c/4.7.2/include  -I/opt/share/HDF5_intel/1.10.5/include
+NETCDF_LIBS    ?= -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lsz -lz
+
+###### Special library for LETKF
+
+###### Math library
+# Please set environment variable
+# example:
+# export MATHLIB_LIBS="-mkl=sequential"
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

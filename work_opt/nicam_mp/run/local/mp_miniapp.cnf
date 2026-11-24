@@ -1,0 +1,97 @@
+########################################################################
+#
+# NICAM NSW6 cloud-microphysics mini-app config  --  size: region0
+#
+# Same namelist style as NICAM's nhm_driver.cnf.  Only the namelists the
+# microphysics chain actually reads are present:
+#   &IOPARAM &PROFPARAM &ADMPARAM &GRDPARAM &CNSTPARAM &RUNCONFPARAM
+#   &NM_MP_DRIVER_INIT &NM_MP_NSW6 &MP_MINIAPPPARAM
+#
+# Switch dataset size: point dataset_dir at ../../dataset/full and set lall = 10.
+#
+########################################################################
+
+##### Global config #####
+
+&IOPARAM
+   log_basename = 'msg',
+/
+
+&PROFPARAM
+   PROF_rap_level = 2,
+/
+
+# lall is a mini-app extension of &ADMPARAM: it is the number of column
+# blocks in the dump (1 for region0, 10 for full), not the
+# region decomposition of the mesh.  See the MINIAPP note in mod_adm.f90.
+&ADMPARAM
+   glevel = 7,
+   rlevel = 0,
+   vlayer = 78,
+   lall   = 1,
+/
+
+&GRDPARAM
+   vgrid_fname = '../../dataset/vgrid78.dat',
+/
+
+##### Run config (MP-relevant values of run/mp-dataset-realstep/nhm_driver.cnf;
+##### the dump ran with production RD/SF/TB/GWD/LAND/OCEAN types, kept at NONE
+##### here -- the MP chain reads none of them) #####
+
+&RUNCONFPARAM
+   run_phys_step       = .true.,
+   EIN_TYPE            = 'SIMPLE',
+   RAIN_TYPE           = 'COLD',
+   NDIFF_LOCATION      = 'IN_LARGE_STEP2',
+   TRC_ADV_TYPE        = 'MIURA2004',
+   TRC_NEG_FIX         = 'OFF',
+   PRCIP_TRN_ECORRECT  = 'KIN2EIN',
+   ROUGHNESS_SEA_TYPE  = 'YQW',
+   CP_TYPE             = 'NONE',
+   MP_TYPE             = 'NSW6',
+   opt_2moment_water   = .false.,
+   MP_DIV_NUM          = 1,
+   RD_TYPE             = 'NONE',
+   RAD_TYPE            = 'ISCCP',
+   SF_TYPE             = 'NO-FLUX',
+   SFC_DIV_NUM         = 1,
+   TB_TYPE             = 'NONE',
+   TB_DIV_NUM          = 1,
+   GWD_TYPE            = 'NONE',
+   CH_TYPE             = 'NONE',
+   AE_TYPE             = 'NONE',
+   opt_aerosol_forcing = .false.,
+   LAND_TYPE           = 'NONE',
+   OCEAN_TYPE          = 'NONE',
+   LAKE_TYPE           = 'NONE',
+   RIVER_TYPE          = 'NONE',
+   TM_RUN              = 'OFF',
+   TM_TRC_VMAX         = 1,
+   FLAG_NUDGING        = .false.,
+/
+
+##### Physics : MP #####
+
+# &NM_MP_DRIVER_INIT is left at its defaults, exactly as in the dump run.
+
+# for MP:NSW6
+&NM_MP_NSW6
+   GAMMA_SAUT         = 6.0D-2,
+   GAMMA_SACR         = 2.5D-2,
+   PSAUT_BETA0        = 6.0D-3,
+   Roh_flag           = .true.,
+   precip_scheme_type = 'Flux-Semilag_new',
+/
+
+##### Mini-app driver #####
+
+&MP_MINIAPPPARAM
+   dataset_dir   = '../../dataset/region0',
+   output_dir    = './output',
+   num_repeat    = 1,
+   tolerance     = 1.D-13,
+   tolerance_abs = 0.D0,
+   validate      = .true.,
+   write_output  = .false.,
+/

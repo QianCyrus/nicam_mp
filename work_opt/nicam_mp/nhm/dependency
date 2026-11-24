@@ -1,0 +1,58 @@
+################################################################################
+#
+# nhm : sources of the NSW6 cloud-microphysics mini-app
+#
+# Same idiom as nicam/NICAM/nhm/dependency : VPATH_*, PRJ_*, LIB_*, MODS_* and
+# the install rules for the library and the program.
+#
+################################################################################
+
+VPATH_NHM = nhm:nhm/share:nhm/physics:
+PRJ_NHM   = $(PRJ_NHM01)
+LIB_NHM   = libnicammp.a
+
+PRJ_NHM01 = mp_miniapp
+PRG_NHM01 = prg_mp_miniapp
+
+MODS_NHM =	\
+	mod_precision.o	\
+	mod_stdio.o	\
+	mod_adm.o	\
+	mod_prof.o	\
+	mod_cnst.o	\
+	mod_misc.o	\
+	mod_grd.o	\
+	mod_ch_includes.o	\
+	mod_runconf.o	\
+	mod_thrmdyn.o	\
+	mod_bndcnd.o	\
+	mod_cnvvar.o	\
+	mod_isotope.o	\
+	\
+	mod_satadjust.o	\
+	mod_vadv1d.o	\
+	mod_precip_transport.o	\
+	mod_mp_nsw6.o	\
+	mod_mp_opt_bridge.o	\
+	mod_mp_driver.o
+
+
+
+$(PRJ_NHM01) : $(NICAM_BINDIR)/$(PRJ_NHM01)
+
+$(NICAM_BINDIR)/$(PRJ_NHM01): $(BUILDDIR)/$(PRJ_NHM01)
+	$(INSTALL) $< $@
+	@echo; echo "##### PROGRAM $(notdir $<) is installed Successfully #####"; echo
+
+$(BUILDDIR)/$(PRJ_NHM01) : $(PRG_NHM01).o $(NICAM_LIBDIR)/$(LIB_NHM)
+	$(LD) $(LDFLAGS) -o $@ $(addprefix $(BUILDDIR)/,$(notdir $^)) $(OPT_KERNEL_LIBS)
+
+$(LIB_NHM): $(NICAM_LIBDIR)/$(LIB_NHM)
+
+$(NICAM_LIBDIR)/$(LIB_NHM): $(BUILDDIR)/$(LIB_NHM)
+	$(INSTALL) $< $@
+	@echo; echo "##### LIBRARY $(LIB_NHM) is installed Successfully #####"; echo
+
+$(BUILDDIR)/$(LIB_NHM): $(MODS_NHM)
+	$(AR) $(ARFLAGS) $@ $(patsubst %,$(BUILDDIR)/%,$(notdir $^))
+	$(RANLIB) $@

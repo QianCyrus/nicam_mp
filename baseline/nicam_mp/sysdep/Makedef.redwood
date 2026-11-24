@@ -1,0 +1,94 @@
+################################################################################
+#
+# ------ For Linux64 & intel fortran&C & mpich2 -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpif90
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?=         $(BUILDDIR)
+
+FFLAGS_FAST  = -fpp -m64 -O3 -xHost -ip             \
+               -assume byterecl -convert big_endian \
+               -ftz -fp-model precise -pc 80        \
+               -mcmodel=medium -shared-intel        \
+               -fno-alias
+
+FFLAGS_QUICKDEBUG = -traceback -fpe0 -CB -CU
+
+FFLAGS_DEBUG = -fpp -m64 -O0                        \
+               -assume byterecl -convert big_endian \
+               -fp-model precise -pc 80             \
+               -check all -warn all -g -traceback   \
+               -mcmodel=medium -shared-intel        \
+               -fno-alias
+
+# Note: An option -heap-arrays is not added because of the bug of the old version of Intel compiler.
+#       If you meet the error caused by the stack memory, please try to use this option.
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpicc
+
+CFLAGS_FAST  = -O3 -m64 -std=c99 -mcmodel=medium
+CFLAGS_DEBUG = -O0 -m64 -std=c99
+
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -openmp -no-heap-arrays
+
+FFLAGS_SYSDEPEND =
+CFLAGS_SYSDEPEND =
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Default settings
+NETCDF_INCLUDE ?= -I/opt/share/netcdf/4.1.2/include     \
+                  -I/opt/share/hdf5/1.8.7/include       \
+                  -I/opt/share/szip/include             \
+                  -I/opt/share/curl/7.19.6/include/curl
+NETCDF_LIBS    ?= -L/opt/share/netcdf/4.1.2/lib -lnetcdff -lnetcdf \
+                  -L/opt/share/hdf5/1.8.7/lib -lhdf5_hl -lhdf5     \
+                  -L/opt/share/szip/lib -lsz                       \
+                  -L/opt/share/zlib/lib -lz                        \
+                  -L/opt/share/curl/7.19.6/lib -lcurl
+# Or, please set environment variable
+
+
+
+###### Special library for LETKF
+
+###### Math library
+# Please set environment variable
+# example:
+# export MATHLIB_LIBS="-mkl=sequential"
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

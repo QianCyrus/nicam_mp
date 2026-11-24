@@ -1,0 +1,86 @@
+################################################################################
+#
+# ------ For Linux64 & NVIDIA SDK & openmpi -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpifort
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?=         $(BUILDDIR)
+
+FFLAGS_FAST  = -Mpreprocess -m64 -fast                \
+               -Mbyteswapio                           \
+               -Mflushz -Mfprelaxed -Mfpapprox -Kieee \
+               -Mvect=assoc -mcmodel=medium
+
+FFLAGS_QUICKDEBUG = -Ktrap=fp -Mbounds -gopt
+
+FFLAGS_DEBUG = -Mpreprocess -m64 -O0  \
+               -Mbyteswapio -Mneginfo \
+               -Mflushz -Ktrap=fp     \
+               -Mbounds               \
+               -g -traceback
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC  = mpicc
+
+CFLAGS_FAST  = -fast
+CFLAGS_DEBUG = -O0
+
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -mp
+
+# cc80 for A100, cc90 for H100/H200
+FFLAGS_OPENACC = -acc -gpu=cc80,maxregcount:128 -Minfo=accel -lnvhpcwrapnvtx
+
+FFLAGS_SYSDEPEND = -DPGI
+CFLAGS_SYSDEPEND = -DPGI
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Settings are inquired by using nf-config & nc-config command (see ~/Mkinclude)
+# Or, please set environment variable
+# example:
+# export NETCDF_INCLUDE="-I/opt/netcdf4-pgi/netcdf4/include -DNDEBUG -DpgiFortran -fPIC /opt/netcdf4-pgi/netcdf4/include"
+# export NETCDF_LIBS="-L/opt/netcdf4-pgi/netcdf4/lib -lnetcdff -lnetcdf"
+
+
+
+###### Special library for LETKF
+
+###### Math library
+# Please set environment variable
+# example:
+# export MATHLIB_LIBS="-lacml"
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

@@ -1,0 +1,19 @@
+&IOPARAM log_basename = "msg_oracle", /
+&PROFPARAM PROF_rap_level = 1, /
+&ADMPARAM glevel = 2, rlevel = 0, vlayer = 78, lall = 1, /
+&GRDPARAM vgrid_fname = "vgrid78_oracle.dat", /
+&RUNCONFPARAM
+  run_phys_step = .true.,
+  EIN_TYPE = "SIMPLE",
+  RAIN_TYPE = "COLD",
+  PRCIP_TRN_ECORRECT = "KIN2EIN",
+  MP_TYPE = "NSW6",
+  MP_DIV_NUM = 1,
+/
+&NM_MP_NSW6
+  GAMMA_SAUT = 6.0D-2,
+  GAMMA_SACR = 2.5D-2,
+  PSAUT_BETA0 = 6.0D-3,
+  Roh_flag = .true.,
+  precip_scheme_type = "Flux-Semilag_new",
+/

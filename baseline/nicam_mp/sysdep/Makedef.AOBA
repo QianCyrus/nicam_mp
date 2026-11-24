@@ -1,0 +1,93 @@
+################################################################################
+#
+# ------ FOR NIES-SC2020, SX-Aurora -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpinfort
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?= $(BUILDDIR)
+
+FFLAGS_FAST  = -O3 -fpp -finline-functions                                   \
+               -mvector-power-to-explog -mvector-power-to-sqrt               \
+               -std=f2003 -report-diagnostics -report-format -fextend-source \
+               -mstack-arrays
+#               -floop-count=5000
+
+FFLAGS_QUICKDEBUG = -fcheck=bounds -minit-stack=nan -traceback
+
+FFLAGS_DEBUG = -O0 -fpp                                    \
+               -fcheck=all -minit-stack=nan -mmemory-trace \
+               -std=f2003 -report-all -fextend-source      \
+               -g -traceback
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpincc
+
+CFLAGS_FAST  =
+CFLAGS_DEBUG = -g -traceback
+
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -fopenmp
+
+# Performance monitor
+# disable
+PERF_MONIT = -no-ftrace
+# ftrace
+#PERF_MONIT = -ftrace
+
+FFLAGS_SYSDEPEND = $(PERF_MONIT) -DNFORT
+CFLAGS_SYSDEPEND = $(PERF_MONIT) -DNFORT
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Default settings
+NETCDF_INCLUDE ?=
+NETCDF_LIBS    ?=
+# Or, please set environment variable
+# example:
+# export NETCDF_INCLUDE="-I/opt/share/netCDF-f_ve/4.4.4/include -I/opt/share/netCDF_tools/include -I/opt/share/netCDF-c_ve/4.6.1/include"
+# export NETCDF_LIBS="-L/opt/share/netCDF-f_ve/4.4.4/lib -L/opt/share/netCDF_tools/lib -L/opt/share/netCDF-c_ve/4.6.1/lib -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lsz -lz -ldl"
+
+
+
+###### Special library for LETKF
+
+###### Math library
+# Default settings (should be set NLC path)
+MATHLIB_LIBS ?="-llapack -lblas_sequential"
+# Or, please set environment variable
+# example:
+# export MATHLIB_LIBS="-llapack -lblas_sequential"
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = nar
+ARFLAGS = r
+RANLIB  = touch

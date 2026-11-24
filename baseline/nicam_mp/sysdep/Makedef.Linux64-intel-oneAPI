@@ -1,0 +1,86 @@
+################################################################################
+#
+# ------ For Linux64 & intel fortran&C & intel mpi -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpiifx
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?=         $(BUILDDIR)
+
+FFLAGS_FAST  = -fpp -m64 -O3 -xCORE-AVX512          \
+               -assume byterecl -convert big_endian \
+               -fp-model source -extend-source      \
+               -mcmodel=medium
+
+FFLAGS_QUICKDEBUG = -traceback -fpe0 -CB -CU
+
+FFLAGS_DEBUG = -fpp -m64 -O0                         \
+               -assume byterecl -convert big_endian  \
+               -fpe0 -fp-model source -extend-source \
+               -check all -warn all -g -traceback    \
+               -mcmodel=medium
+
+# Note: An option -heap-arrays is not added because of the bug of the old version of Intel compiler.
+#       If you meet the error caused by the stack memory, please try to use this option.
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpiicx
+
+CFLAGS_FAST  = -O3 -m64 -std=c99 -xCORE-AVX512 -ftz -mcmodel=medium -Wno-int-conversion
+CFLAGS_DEBUG = -O0 -m64 -std=c99
+
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -qopenmp -no-heap-arrays
+
+FFLAGS_SYSDEPEND = -DLOWMPITAG
+CFLAGS_SYSDEPEND = -DLOWMPITAG
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Settings are inquired by using nf-config & nc-config command (see ~/Mkinclude)
+# Or, please set environment variable
+# example:
+# export NETCDF_INCLUDE="-I/ap/netcdf4-fortran/4.4.2-intel/include -I/ap/HDF5/1.8.16-intel/include -I/ap/netcdf4/4.3.3.1-intel/include"
+# export NETCDF_LIBS="-L/ap/netcdf4-fortran/4.4.2-intel/lib -L/ap/HDF5/1.8.16-intel/lib -L/ap/netcdf4/4.3.3.1-intel/lib -lnetcdff -lnetcdf"
+
+
+
+###### Special library for LETKF
+
+###### Math library
+# Please set environment variable
+# example:
+# export MATHLIB_LIBS="-mkl=sequential"
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

@@ -1,0 +1,85 @@
+################################################################################
+#
+# ------ FOR Linux 64bit & intel fortran&C & intel mpi -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpiifort
+
+MODDIROPT ?= -module $(BUILDDIR)
+OBJDIR    ?=         $(BUILDDIR)
+
+FFLAGS_FAST  = -fpp -m64 -O3 -xHost                 \
+               -assume byterecl -convert big_endian \
+               -fp-model source                     \
+               -mcmodel=medium
+
+FFLAGS_QUICKDEBUG = -traceback -fpe0 -CB -CU
+
+FFLAGS_DEBUG = -fpp -m64 -O0                        \
+               -assume byterecl -convert big_endian \
+               -fpe0 -fp-model source               \
+               -check all -warn all -g -traceback   \
+               -mcmodel=medium
+
+# Note: An option -heap-arrays is not added because of the bug of the old version of Intel compiler.
+#       If you meet the error caused by the stack memory, please try to use this option.
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpiicc
+
+CFLAGS_FAST  = -O3 -m64 -std=c99 -xHost -ip -ftz -mcmodel=medium
+CFLAGS_DEBUG = -O0 -m64 -std=c99
+
+
+
+##### Special setting
+
+FFLAGS_OPENMP = -openmp -no-heap-arrays
+
+FFLAGS_SYSDEPEND =
+CFLAGS_SYSDEPEND =
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Default settings
+NETCDF_INCLUDE ?= -I/opt/share/netcdf/4.1.3-intel/include -I/opt/share/hdf5/1.8.20/include
+NETCDF_LIBS    ?= -L/opt/share/netcdf/4.1.3-intel/lib -L/opt/share/hdf5/1.8.20/lib -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lm -lz
+# Or, please set environment variable
+
+
+
+###### Special library for LETKF
+
+###### Math library
+# Please set environment variable
+# example:
+# export MATHLIB_LIBS="-mkl=sequential"
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib

@@ -1,0 +1,116 @@
+################################################################################
+#
+# Common definitions for the NICAM NSW6 cloud-microphysics mini-app
+#
+# Trimmed copy of NICAM's own Mkinclude (nicam/Mkinclude).  Everything that
+# selects a component the microphysics never reaches (Coupler, COCO, LETKF,
+# NetCDF/FIO, ECCODES, HEALPIX, VTune, MIROC, ZPANDA, NDW6 switching, the
+# fixed-index header) has been dropped: the mini-app links no external library
+# at all.  Deviations from the original are tagged  #--- MINIAPP:
+#
+################################################################################
+
+.DEFAULT_GOAL := all
+
+
+
+##### General Settings #####
+
+ifeq ($(origin NICAM_BINDIR),undefined)
+   NICAM_BINDIR = $(TOPDIR)/bin
+endif
+
+ifeq ($(origin NICAM_LIBDIR),undefined)
+   NICAM_LIBDIR = $(TOPDIR)/lib
+endif
+
+
+
+##### Debug Settings #####
+
+ifeq ($(NICAM_DEBUG),T)
+   FFLAGS = $(FFLAGS_DEBUG) $(FFLAGS_SYSDEPEND) -DDEBUG
+   CFLAGS = $(CFLAGS_DEBUG) $(CFLAGS_SYSDEPEND)
+else
+   FFLAGS = $(FFLAGS_FAST)  $(FFLAGS_SYSDEPEND)
+   CFLAGS = $(CFLAGS_FAST)  $(CFLAGS_SYSDEPEND)
+   ifeq ($(NICAM_QUICKDEBUG),T)
+      FFLAGS += $(FFLAGS_QUICKDEBUG) -DQUICKDEBUG
+   endif
+endif
+
+
+
+#--- MINIAPP: -DMINIAPP switches every source deviation that had to be made in
+#--- order to extract the NSW6 chain from NICAM.  It is ALWAYS on here (the
+#--- sources are useless without it); it exists so that a diff against the
+#--- NICAM original shows one guard per deviation instead of deleted code.
+#--- grep -rn 'MINIAPP' nhm/  lists every one of them.
+FFLAGS += -DMINIAPP
+
+
+
+##### Performance optimization #####
+
+ifeq ($(ENABLE_OPENMP),T)
+   FFLAGS += $(FFLAGS_OPENMP)
+endif
+
+ifeq ($(ENABLE_OPENACC),T)
+   FFLAGS += $(FFLAGS_OPENACC)
+endif
+
+ifeq ($(USE_SINGLEFP),T)
+   FFLAGS += -DSINGLE
+endif
+ifeq ($(USE_SINGLEFP_PHY),T)
+   FFLAGS += -DSINGLE_PHY
+endif
+ifeq ($(USE_SINGLEFP_MP),T)
+   FFLAGS += -DSINGLE_MP
+endif
+
+ifeq ($(ENABLE_MORETIMER),T)
+   FFLAGS += -DMORETIMER
+endif
+
+
+
+################################################################################
+#
+# List of environments
+#
+################################################################################
+
+envlist:
+	@echo
+	@echo "******************************************************************************************"
+	@echo "<NICAM-MP mini-app environments> : if T then on, else off"
+	@echo "[General]"
+	@echo " + SYSTEM                               [NICAM_SYS]            :" $(NICAM_SYS)
+	@echo "[Debug]"
+	@echo " + Activate debug option?               [NICAM_DEBUG]          :" $(NICAM_DEBUG)
+	@echo " + Activate quick debug option?         [NICAM_QUICKDEBUG]     :" $(NICAM_QUICKDEBUG)
+	@echo "[Performance optimization]"
+	@echo " + Use single floating-point precision? [USE_SINGLEFP]         :" $(USE_SINGLEFP)
+	@echo "   + for physics                        [USE_SINGLEFP_PHY]     :" $(USE_SINGLEFP_PHY)
+	@echo "   + for physics MP                     [USE_SINGLEFP_MP]      :" $(USE_SINGLEFP_MP)
+	@echo " + Enable to use OpenMP?                [ENABLE_OPENMP]        :" $(ENABLE_OPENMP)
+	@echo " + Enable to use OpenACC?               [ENABLE_OPENACC]       :" $(ENABLE_OPENACC)
+	@echo "[Special]"
+	@echo " + Activate additional timers?          [ENABLE_MORETIMER]     :" $(ENABLE_MORETIMER)
+	@echo "******************************************************************************************"
+
+conflist:
+	@echo
+	@echo "******************************************************************************************"
+	@echo "<Configurations>"
+	@echo "[Path]"
+	@echo " + TOPDIR       :" $(TOPDIR)
+	@echo " + BUILDDIR     :" $(BUILDDIR)
+	@echo " + NICAM_BINDIR :" $(NICAM_BINDIR)
+	@echo " + NICAM_LIBDIR :" $(NICAM_LIBDIR)
+	@echo " + OBJDIR       :" $(OBJDIR)
+	@echo "[FLAGS]"
+	@echo " + FFLAGS       :" $(FFLAGS)
+	@echo "******************************************************************************************"

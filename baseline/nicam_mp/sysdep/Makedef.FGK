@@ -1,0 +1,100 @@
+################################################################################
+#
+# ------ For Fugaku -----
+#
+################################################################################
+
+##### Fortran setting
+#FFLAGS is set in Mkinclude. FFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+FC = mpifrtpx
+
+MODDIROPT ?= -M $(BUILDDIR)
+OBJDIR    ?=    $(BUILDDIR)
+
+FFLAGS_FAST  = -Kfast,parallel,ocl,preex,array_private,noalias=s,mfunc=2 \
+               -Nlst=i -Nlst=t -X03 -Ncompdisp -Koptmsg=1 -Cpp           \
+               -Kdynamic_iteration -Ksimd -x-                            \
+               -Kauto,threadsafe -Kloop_fission_threshold=50
+
+FFLAGS_QUICKDEBUG = -Nquickdbg -NRtrap -Knoilfunc
+
+FFLAGS_DEBUG = -O0 -g                                          \
+               -Nlst=i -Nlst=t -X03 -Ncompdisp -Koptmsg=2 -Cpp \
+               -AT -Ap -Ec -Eg -Ha -He -Hf -Ho -Hs -Hu -Hx     \
+               -Ncheck_std=03s -Ncheck_std=03d -Ncheck_std=03o \
+               -Ncheck_cache_arraysize -Ncheck_global          \
+               -DDEBUG
+
+
+
+##### C setting
+#CFLAGS is set in Mkinclude. CFLAGS_DEBUG is used if NICAM_DEBUG=T
+
+CC = mpifccpx
+
+CFLAGS_FAST  = -Kfast,parallel,ocl,preex,array_private,region_extension,restp=all -Ksimd
+CFLAGS_DEBUG = -O0
+
+
+
+##### Special setting
+
+ifeq ($(origin ENABLE_OPENMP),undefined)
+   ENABLE_OPENMP = T
+endif
+
+FFLAGS_OPENMP = -Kopenmp -Nfjomplib
+# enable + disable parallel
+# FFLAGS_OPENMP = -Kopenmp,noparallel
+
+# Performance monitor
+# disable
+#PERF_MONIT = -Nnofjprof -U_FIPP_ -U_FAPP_
+# fipp
+PERF_MONIT = -D_FIPP_ -U_FAPP_
+# fapp / fine PA
+#PERF_MONIT = -U_FIPP_ -D_FAPP_
+
+FFLAGS_SYSDEPEND = $(PERF_MONIT)
+CFLAGS_SYSDEPEND = $(PERF_MONIT)
+
+
+
+##### Linker setting
+
+LD      = $(FC)
+LDFLAGS = $(FFLAGS)
+
+LD_CXX  = mpiFCCpx
+
+SOFLAGS = -shared -fPIC
+
+
+
+################################################################################
+
+###### NetCDF library
+# Default settings
+NETCDF_INCLUDE ?=
+NETCDF_LIBS    ?=
+# Or, please set environment variable
+# example:
+# export NETCDF_INCLUDE=""
+# export NETCDF_LIBS=""
+
+
+
+###### Special library for LETKF
+
+###### Math library
+MATHLIB_LIBS ?= -SSL2BLAMP -SCALAPACK
+
+
+
+##### for frontend
+MAKE    = make
+INSTALL = cp -u
+AR      = ar
+ARFLAGS = r
+RANLIB  = ranlib
