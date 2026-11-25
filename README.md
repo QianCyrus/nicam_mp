@@ -5,8 +5,9 @@
 </p>
 
 <p align="center">
+  <img alt="Framework: Native CUDA C++17" src="https://img.shields.io/badge/Framework-Native%20CUDA%20C%2B%2B17-76B900?style=flat-square" />
   <img alt="Precision: Strict IEEE FP64" src="https://img.shields.io/badge/Precision-Strict%20IEEE%20FP64-00599C?style=flat-square" />
-  <img alt="Architecture: NVIDIA Hopper SM90a" src="https://img.shields.io/badge/GPU-NVIDIA%20Hopper%20SM90a-76B900?style=flat-square" />
+  <img alt="Architecture: NVIDIA Hopper SM90a" src="https://img.shields.io/badge/Target-Hopper%20SM90a%20%2F%20CUDA%20Graphs-76B900?style=flat-square" />
   <img alt="Register Spill: 0 Bytes" src="https://img.shields.io/badge/Register%20Spill-0%20Bytes%20(10%2F10%20Kernels)-2EA44F?style=flat-square" />
   <img alt="Validation: N_FAIL = 0" src="https://img.shields.io/badge/Fortran%20Oracle-N__FAIL%20%3D%200-2EA44F?style=flat-square" />
   <img alt="Speedup: 7.86x Same-GPU" src="https://img.shields.io/badge/H200%20Speedup-7.86%C3%97%20Same--GPU-E36209?style=flat-square" />
@@ -19,9 +20,11 @@
 
 ### 1. Overview
 
-This repository provides a **structure-preserving mathematical reformulation** and **native NVIDIA Hopper (`sm_90a`) strict IEEE FP64 CUDA implementation** of the six-category bulk cloud microphysics scheme (**NSW6**) from the Non-hydrostatic Icosahedral Atmospheric Model (**NICAM**).
+This repository provides a **structure-preserving mathematical reformulation** and **native CUDA C++17 (`sm_90a`, CUDA Graphs) strict IEEE FP64 implementation** of the six-category bulk cloud microphysics scheme (**NSW6**) from the Non-hydrostatic Icosahedral Atmospheric Model (**NICAM**).
 
-Complementing algorithm-preserving Fortran-to-Kokkos migration efforts (e.g., Ren, Shimokawabe, & Yashiro, [`arXiv:2610.41313`](https://arxiv.org/abs/2610.41313)), this work investigates how **algorithmic and mathematical restructuring** of the governing discrete microphysics—combined with spill-free GPU operator engineering—simultaneously achieves:
+> **Implementation Framework**: This optimized implementation is written in **native NVIDIA CUDA C++17** (no OpenACC, Triton, or Kokkos runtime overhead), while isolating all mathematical reductions inside a portable, header-only `__host__ __device__` C++ core (`work_opt/nicam_mp/cuda_kernels/nsw6_math_core.cuh`) so the same numerical formulations can also be evaluated inside C++/Kokkos NICAM.
+
+Complementing algorithm-preserving Fortran-to-Kokkos migration efforts (Ren, Shimokawabe, & Yashiro, [`arXiv:2610.41313`](https://arxiv.org/abs/2610.41313)), this work investigates how **algorithmic and mathematical restructuring** of the governing discrete microphysics—combined with spill-free GPU operator engineering—simultaneously achieves:
 
 1. **Multiplicative runtime speedup** (`7.86×` on the same H200 GPU: `2.73×` GPU engineering × `2.88×` mathematical reduction), operating at `85%` of measured HBM3e streaming bandwidth;
 2. **Strict IEEE double-precision fidelity** (`N_FAIL = 0` across all 23 output arrays / 34 checked diagnostics against the unmodified NICAM Fortran modules);
@@ -29,11 +32,35 @@ Complementing algorithm-preserving Fortran-to-Kokkos migration efforts (e.g., Re
 
 ---
 
-### 2. Key Results at a Glance
+### 2. Research Goal, Cross-Framework Comparison & Todo
+
+- **Goal**: Following **Ren et al. ([`arXiv:2610.41313`](https://arxiv.org/abs/2610.41313))** as a benchmarking and evaluation guideline, perform a systematic, apples-to-apples performance and accuracy comparison across GPU programming models for NICAM NSW6—comparing the **Fortran/OpenACC** baseline, the **Triton** version, the **C++/Kokkos** version, and this repository's **Native CUDA C++** implementation (both algorithm-preserving and mathematically reformulated modes).
+- **Todo (`@QIAN JIAWEI`)**:
+  - [ ] **Check the performance of the Kokkos version** (`arXiv:2610.41313`) under the same grid size, real checkpoint, and timing protocol.
+  - [ ] **Execute unified Miyabi-G (GH200) cross-framework benchmarks** comparing **OpenACC**, **Triton**, **Kokkos**, and **Native CUDA C++** (`Mode 1 ENG` vs. `Mode 2 ENG+MATH` vs. `Mode 3 MONO`) using Ren et al.'s evaluation methodology once Miyabi-G maintenance concludes.
+  - [ ] **Evaluate portability of `nsw6_math_core.cuh` inside Kokkos** to cleanly decouple *programming-model overhead* (OpenACC / Triton / Kokkos / CUDA) from *mathematical-algorithmic speedup*.
+
+#### Cross-Framework Comparison Matrix (Current Status)
+
+| Implementation / Backend | Programming Model | Algorithm Variant | Measured Runtime (Full `166,410×80`) | Status |
+| :--- | :--- | :--- | :---: | :--- |
+| **NICAM Baseline** | Fortran + OpenACC | Original NSW6 | `78.19 ms` (Miyabi-G GH200) | Recorded baseline |
+| **Triton Port** | Python / Triton | Original NSW6 | `68.57 ms` (Miyabi-G GH200) | Recorded baseline |
+| **Kokkos Port** (`arXiv:2610.41313`) | C++ / Kokkos | Original NSW6 | **TBD** *(Miyabi-G GH200)* | **Todo (`@QIAN JIAWEI`)** |
+| **This Repo — Mode 0 (`BB-H200`)** | Native CUDA C++ (unfused) | Original NSW6 | `31.90 ms` (NVIDIA H200) | Verified (`N_FAIL = 0`) |
+| **This Repo — Mode 1 (`ENG`)** | Native CUDA C++ (Gen-4) | Original NSW6 | `11.70 ms` (NVIDIA H200) | Verified (`2.73×` vs. Mode 0) |
+| **This Repo — Mode 2 (`ENG+MATH`)** | Native CUDA C++ + Graphs | Math-reformulated (exact) | **`4.06 ms`** / `3.89 ms` w/o `rceff` (H200) | Verified (`7.86×` / `8.21×`; GH200 PBS ready) |
+| **This Repo — Mode 3 (`MONO`)** | Native CUDA C++ + Graphs | + Monotone sedimentation | **`4.41 ms`** (NVIDIA H200) | Verified (`7.23×`, `1.83×10⁻¹⁵` mass drift) |
+
+> *Note*: Direct like-for-like cross-framework ratios must be measured on identical hardware (Miyabi-G GH200) and identical real-atmosphere checkpoints; H200 and GH200 numbers above are listed separately for transparency.
+
+---
+
+### 3. Key Results at a Glance
 
 All GPU timings are measured on a single **NVIDIA H200 (141 GB HBM3e, CUDA 13.0)** at full NICAM production array size (**10 regions × 16,641 columns × 80 levels = 13.31M cells**, `dt = 30 s`), strictly compiled with `-O3 -arch=sm_90a --prec-div=true --prec-sqrt=true` (no `--use_fast_math`), using **8 cyclically rotated paired blocks** (95% Student-*t* confidence intervals, df = 7).
 
-#### 2.1 Same-GPU Performance Attribution (H200, Full 13.31M Cells)
+#### 3.1 Same-GPU Performance Attribution (H200, Full 13.31M Cells)
 
 | Configuration | Description | Time / Step (ms) | Speedup vs. Mode 0 | Incremental Gain |
 | :--- | :--- | :---: | :---: | :---: |
@@ -47,7 +74,7 @@ All GPU timings are measured on a single **NVIDIA H200 (141 GB HBM3e, CUDA 13.0)
 - **Model-year impact**: Over one model year (`1,051,200` steps), microphysics runtime drops from **`9.31 h` to `1.19 h`**.
 - **Cross-hardware orientation** *(non-like-for-like; different GPU & inputs)*: Compared against historical GH200 measurements of original Fortran/OpenACC (`78.19 ms`) and Triton (`68.57 ms`), Mode 2 corresponds to `19.3×` and `16.9×` ratios, respectively. Ready-to-run Miyabi-G GH200 PBS scripts are included under `work_opt/nicam_mp/run/miyabi-g/`.
 
-#### 2.2 Work-Counter Reductions (Mode 1 → Mode 2, One Full Step)
+#### 3.2 Work-Counter Reductions (Mode 1 → Mode 2, One Full Step)
 
 | Operation / Metric | Reduction Factor | Source |
 | :--- | :---: | :--- |
@@ -57,7 +84,7 @@ All GPU timings are measured on a single **NVIDIA H200 (141 GB HBM3e, CUDA 13.0)
 | Saturation-adjustment iterations | **`2.46×` fewer** | Associated-Laguerre Householder-4 |
 | Interior cells in heavy microphysics | **`6.0×` fewer** | Clear-sky dry-cell screening (`83.3%` skipped) |
 
-#### 2.3 Validation & Multi-Step Conservation (`dt = 30 s`)
+#### 3.3 Validation & Multi-Step Conservation (`dt = 30 s`)
 
 | Experiment | Modes | Water-Mass Residual | Moist Energy Residual | Notes |
 | :--- | :--- | :---: | :---: | :--- |
@@ -71,9 +98,9 @@ All GPU timings are measured on a single **NVIDIA H200 (141 GB HBM3e, CUDA 13.0)
 
 ---
 
-### 3. What Was Done
+### 4. What Was Done
 
-#### 3.1 Structure-Preserving Mathematical Reformulations
+#### 4.1 Structure-Preserving Mathematical Reformulations
 
 1. **Multi-Species Semi-Lagrangian Sedimentation (Fubini Factorisation & Monotone Projection)**
    - *Fubini summation reordering*: Reversing the species–level accumulation order collapses **28 species–attribute flux sweeps** into a single shared mass weight per column interval, eliminating redundant lookups and memory traffic.
@@ -85,13 +112,13 @@ All GPU timings are measured on a single **NVIDIA H200 (141 GB HBM3e, CUDA 13.0)
 4. **Clear-Sky Screening & Column Sparsity**
    - Over `83.3%` of interior atmospheric cells are clear and dry, and only `40.0%` of columns contain precipitation. Decoupling dry cells and non-precipitating columns removes severe warp divergence from heavy microphysics and sedimentation kernels.
 
-#### 3.2 Four-Generation Hopper (`sm_90a`) CUDA Engineering
+#### 4.2 Four-Generation Hopper (`sm_90a`) CUDA Engineering
 
 - **Gen 1 → Gen 2 (`9.12 ms → 5.71 ms`)**: Split sedimentation into half-level and full-level passes (eliminating `140 KB/block` shared-memory occupancy collapse); relocated physics constants to `__constant__` memory; eliminated `960 MB` of dead stores; fused saturation adjustment, negative filter, diagnostics, and cloud fraction into a single kernel.
 - **Gen 3 (`5.71 ms → 5.34 ms`)**: Introduced a 44-register screening kernel streaming at `3.64 TB/s` that completes dry cells immediately and compacts the `16.7%` active wet cells via **warp-aggregated atomics** with packed 32-bit coordinates, enabling full-warp execution inside the 194-register microphysics kernel.
 - **Gen 4 (`5.34 ms → 4.06 ms`)**: Relocated the 32-pointer state descriptor into `__constant__` memory (freeing `~64` registers/thread), achieving **0 bytes stack frame and 0 bytes register spill across all 10 kernels** (down from up to `752 B/thread` in Gen 1). Replaced persistent work queues with upper-bound early-exit grids for **full-step CUDA Graph capture**, added coalesced 3D vertical kinetic energy initialization, and skipped zero-density divisions and unchanged dry-level stores.
 
-#### 3.3 Software Architecture & Portability
+#### 4.3 Software Architecture & Portability
 
 Rather than relying on high-level DSLs (OpenACC/Triton/PyTorch), the codebase uses a lightweight, zero-dependency three-layer architecture:
 
@@ -101,7 +128,7 @@ Rather than relying on high-level DSLs (OpenACC/Triton/PyTorch), the codebase us
 
 ---
 
-### 4. Repository Layout
+### 5. Repository Layout
 
 ```text
 .
@@ -130,14 +157,14 @@ Rather than relying on high-level DSLs (OpenACC/Triton/PyTorch), the codebase us
 
 ---
 
-### 5. Build, Verification & Reproducibility
+### 6. Build, Verification & Reproducibility
 
-#### 5.1 Verify Baseline Integrity
+#### 6.1 Verify Baseline Integrity
 ```bash
 cd baseline && shasum -a 256 -c SHA256SUMS
 ```
 
-#### 5.2 Run Full-Scale Hopper H200 Paired CI Benchmark (Strict IEEE FP64)
+#### 6.2 Run Full-Scale Hopper H200 Paired CI Benchmark (Strict IEEE FP64)
 ```bash
 cd work_opt/hopper_cuda
 nvcc -O3 -std=c++17 -arch=sm_90a --prec-div=true --prec-sqrt=true \
@@ -145,7 +172,7 @@ nvcc -O3 -std=c++17 -arch=sm_90a --prec-div=true --prec-sqrt=true \
 ./bench_paper_ci
 ```
 
-#### 5.3 Build & Run on Miyabi-G (GH200)
+#### 6.3 Build & Run on Miyabi-G (GH200)
 ```bash
 cd work_opt/nicam_mp
 ./compile_opt_gpu.sh
@@ -161,7 +188,9 @@ qsub run/miyabi-g/pbs_multistep.sh      # Multi-step budget verification
 
 ### 1. 概要
 
-本リポジトリは、全球非静力学正二十面体大気モデル **NICAM** の 6 カテゴリー・バルク雲微物理スキーム（**NSW6**）に対して、**構造保存型の数理再定式化**および **NVIDIA Hopper（`sm_90a`）向け厳密倍精度（IEEE FP64）ネイティブ CUDA 実装**を提供するものです。
+本リポジトリは、全球非静力学正二十面体大気モデル **NICAM** の 6 カテゴリー・バルク雲微物理スキーム（**NSW6**）に対して、**構造保存型の数理再定式化**および **ネイティブ CUDA C++17（Hopper `sm_90a` / CUDA グラフ）による厳密倍精度（IEEE FP64）実装**を提供するものです。
+
+> **実装フレームワーク**：本リポジトリの最適化版は **ネイティブ NVIDIA CUDA C++17** で実装されています（OpenACC / Triton / Kokkos 等のランタイムを介さずハードウェアを直接制御）。一方、3 つの数理再定式化は外部依存のない Header-only `__host__ __device__` C++ コア（`work_opt/nicam_mp/cuda_kernels/nsw6_math_core.cuh`）として分離しており、C++/Kokkos 版 NICAM への移植・比較評価も容易に行える設計です。
 
 既存アルゴリズムを忠実に保持した Fortran→Kokkos 移植研究（Ren, Shimokawabe, & Yashiro, [`arXiv:2610.41313`](https://arxiv.org/abs/2610.41313)）の次段階として、離散物理スキーム内部の数理構造そのものを再構成し、スピルゼロの GPU オペレータ設計と組み合わせることで、以下の 3 点を同時に達成しました。
 
@@ -171,11 +200,35 @@ qsub run/miyabi-g/pbs_multistep.sh      # Multi-step budget verification
 
 ---
 
-### 2. 主な成果サマリー
+### 2. 研究目標・フレームワーク横断比較・今後の課題（Todo）
+
+- **目標（Goal）**：**Ren らの論文（[`arXiv:2610.41313`](https://arxiv.org/abs/2610.41313)）の評価指針（ガイドライン）** に従い、NICAM NSW6 の各 GPU 実装バックエンド——**Fortran/OpenACC 版**、**Triton 版**、**C++/Kokkos 版**、および本リポジトリの **ネイティブ CUDA C++ 版**（アルゴリズム保存モードおよび数理再定式化モード）——の性能と数値精度を同一条件で体系的に比較評価する。
+- **Todo（`@QIAN JIAWEI`）**：
+  - [ ] **Kokkos 版（`arXiv:2610.41313`）の性能計測・検証**：同一格子規模・実チェックポイント・統一計測プロトコルにて Kokkos 版の実行時間を測定する。
+  - [ ] **Miyabi-G（GH200）での横断ベンチマーク実施**：メンテナンス完了後、Ren らのガイドラインに基づき **OpenACC / Triton / Kokkos / ネイティブ CUDA C++（Mode 1 / 2 / 3）** の同一ハードウェア比較を完了させる。
+  - [ ] **Kokkos バックエンドへの `nsw6_math_core.cuh` 統合検証**：フレームワーク起因のオーバーヘッド（OpenACC vs. Triton vs. Kokkos vs. CUDA）と数理アルゴリズム改革による高速化を明確に分離する。
+
+#### バックエンド別比較マトリクス（現在の状況）
+
+| 実装 / バックエンド | フレームワーク | アルゴリズム | 実測実行時間（全領域 `166,410×80`） | ステータス |
+| :--- | :--- | :--- | :---: | :--- |
+| **NICAM 元ベースライン** | Fortran + OpenACC | 原 NSW6 | `78.19 ms`（Miyabi-G GH200） | 計測済ベースライン |
+| **Triton 移植版** | Python / Triton | 原 NSW6 | `68.57 ms`（Miyabi-G GH200） | 計測済ベースライン |
+| **Kokkos 移植版**（`arXiv:2610.41313`） | C++ / Kokkos | 原 NSW6 | **未計測（TBD）** *(Miyabi-G GH200)* | **Todo（`@QIAN JIAWEI`）** |
+| **本リポジトリ — Mode 0 (`BB-H200`)** | ネイティブ CUDA C++（非融合） | 原 NSW6 | `31.90 ms`（NVIDIA H200） | 検証済（`N_FAIL = 0`） |
+| **本リポジトリ — Mode 1 (`ENG`)** | ネイティブ CUDA C++（第 4 世代） | 原 NSW6 | `11.70 ms`（NVIDIA H200） | 検証済（Mode 0 比 `2.73×`） |
+| **本リポジトリ — Mode 2 (`ENG+MATH`)** | ネイティブ CUDA C++ + グラフ | 数理再定式化（厳密等価） | **`4.06 ms`** / `rceff` なし `3.89 ms`（H200） | 検証済（`7.86×` / `8.21×`、GH200 用 PBS 準備済） |
+| **本リポジトリ — Mode 3 (`MONO`)** | ネイティブ CUDA C++ + グラフ | ＋単調後向包絡射影 | **`4.41 ms`**（NVIDIA H200） | 検証済（`7.23×`、質量誤差 `1.83×10⁻¹⁵`） |
+
+> *注*：厳密なフレームワーク間比較は同一ハードウェア（Miyabi-G GH200）および同一実データ入力で行う必要があるため、上記表では H200 と GH200 の数値を明確に区別して記載しています。
+
+---
+
+### 3. 主な成果サマリー
 
 GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて、NICAM 本番相当の全領域格子（**10 リージョン × 16,641 鉛直柱 × 80 層 = 1,331 万格子点**、`dt = 30 s`）を対象に実施しました。全カーネルを厳密倍精度オプション（`-O3 -arch=sm_90a --prec-div=true --prec-sqrt=true`、`--use_fast_math` 禁止）でコンパイルし、**実行順序を巡回させた 8 ペアブロック計測**（自由度 7 の Student-*t* 95% 信頼区間）により統計評価しています。
 
-#### 2.1 同一 GPU における要因分解（NVIDIA H200、全 1,331 万格子点）
+#### 3.1 同一 GPU における要因分解（NVIDIA H200、全 1,331 万格子点）
 
 | 構成 | 内容 | 1 ステップ実行時間 (ms) | 対 Mode 0 速度比 | 段階別寄与 |
 | :--- | :--- | :---: | :---: | :---: |
@@ -189,7 +242,7 @@ GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて�
 - **気候シミュレーション換算**：1 モデル年（`1,051,200` ステップ）あたりの雲微物理計算時間は **`9.31 時間` → `1.19 時間`** に短縮されます。
 - **参考値（異種 GPU 比較）**：Miyabi-G（GH200）上の既存 Fortran/OpenACC 版（`78.19 ms`）および Triton 版（`68.57 ms`）と比較すると、Mode 2 はそれぞれ `19.3 倍`・`16.9 倍` に相当します（※ハードウェア・入力条件が異なるため参考値）。Miyabi-G 向けの実データ検証・ベンチマーク用 PBS スクリプトは `work_opt/nicam_mp/run/miyabi-g/` に完備しています。
 
-#### 2.2 演算量・処理格子数の削減（Mode 1 → Mode 2、1 ステップ全体）
+#### 3.2 演算量・処理格子数の削減（Mode 1 → Mode 2、1 ステップ全体）
 
 | 指標 | 削減倍率 | 主な要因 |
 | :--- | :---: | :--- |
@@ -199,7 +252,7 @@ GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて�
 | 飽和調節の反復回数 | **`2.46 分の 1`** | 陪ラゲール多項式による 4 次ハウスホルダー法 |
 | 重微物理カーネルの処理格子点 | **`6.0 分の 1`** | 晴天・乾燥格子の事前スクリーニング（`83.3%` を除外） |
 
-#### 2.3 差分検証および多数ステップ保存性（`dt = 30 s`）
+#### 3.3 差分検証および多数ステップ保存性（`dt = 30 s`）
 
 | 検証実験 | モード | 水質量相対残差 | 湿潤全エネルギー相対残差 | 備考 |
 | :--- | :--- | :---: | :---: | :--- |
@@ -213,9 +266,9 @@ GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて�
 
 ---
 
-### 3. 実施した最適化内容
+### 4. 実施した最適化内容
 
-#### 3.1 構造保存型の数理再定式化
+#### 4.1 構造保存型の数理再定式化
 
 1. **多水物質・半ラグランジュ鉛直沈降（フビニ因数分解と単調後向包絡射影）**
    - *フビニ和順序交換*：水物質種・物理量ごとの **28 系統の鉛直フラックス走査**を「層優先・種後置」へ組み替え、単一の共有質量重みに集約することで重複メモリアクセスを大幅に削減しました。
@@ -227,13 +280,13 @@ GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて�
 4. **乾燥格子スクリーニングと降水柱の疎性活用**
    - 大気内部の `83.3%` を占める晴天乾燥格子を軽量カーネルで即座に完了させ、`16.7%` の湿潤格子のみを重微物理カーネルへ送出。さらに沈降処理も降水を含む `40.0%` の鉛直柱のみに限定しました。
 
-#### 3.2 Hopper（`sm_90a`）向け 4 世代 CUDA カーネル最適化
+#### 4.2 Hopper（`sm_90a`）向け 4 世代 CUDA カーネル最適化
 
 - **Gen 1 → Gen 2（`9.12 ms → 5.71 ms`）**：沈降を半層・全層の 2 パスに分離し、`140 KB/block` の共有メモリ占有によるオキュパンシ低下を解消。物理定数の `__constant__` 化、`960 MB` の冗長ストア除去、さらに飽和調節・負値フィルタ・診断量・雲量の 1 カーネル融合を実施。
 - **Gen 3（`5.71 ms → 5.34 ms`）**：`3.64 TB/s` で動作する 44 レジスタのスクリーニングカーネルを導入し、32-bit 圧縮座標と **ワープ集約アトミック（warp-aggregated atomics）** で湿潤格子キューを構築。194 レジスタの重微物理カーネルをワープ分岐なしで高効率実行。
 - **Gen 4（`5.34 ms → 4.06 ms`）**：32 本の状態ポインタ記述子も `__constant__` メモリへ移設し（スレッドあたり約 64 レジスタ削減）、**全 10 カーネルでスタックフレーム 0 B・レジスタスピル 0 B** を達成（Gen 1 では最大 `752 B/thread`）。永続キューを上限サイズ＋早期終了グリッドに置換して **1 ステップ全体を CUDA グラフ化**し、3 次元コアレス鉛直運動エネルギー初期化およびゼロ除算・乾燥層再書込の回避を実装。
 
-#### 3.3 採用フレームワークとソフトウェア構成
+#### 4.3 採用フレームワークとソフトウェア構成
 
 高水準 DSL（OpenACC / Triton / PyTorch 等）には依存せず、厳密倍精度科学計算と移植性を両立する 3 層構成を採用しています。
 
@@ -243,7 +296,7 @@ GPU 性能計測は **NVIDIA H200（141 GB HBM3e, CUDA 13.0）** 1 基上にて�
 
 ---
 
-### 4. ビルド・検証手順
+### 5. ビルド・検証手順
 
 ```bash
 # 1. 元ベースラインの無改変確認（SHA-256 チェック）
