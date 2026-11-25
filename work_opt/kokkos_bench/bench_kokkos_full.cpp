@@ -35,6 +35,7 @@
 using ExecSpace  = Kokkos::DefaultExecutionSpace;
 using MemSpace   = ExecSpace::memory_space;
 using ViewD1     = Kokkos::View<double*, MemSpace>;
+using ViewU8     = Kokkos::View<uint8_t*, MemSpace>;
 using ViewU32    = Kokkos::View<uint32_t*, MemSpace>;
 using ViewI32    = Kokkos::View<int*, MemSpace>;
 using TeamPolicy = Kokkos::TeamPolicy<ExecSpace>;
@@ -54,8 +55,9 @@ struct StatePtrs {
 
 struct WorkPtrs {
     double *Vt, *kv, *zdis_m, *rceff, *rctop;
-    uint32_t *wet_cells, *wet_cols, *col_spmask, *wet_count, *wet_col_count;
-    int *col_ktop;
+    uint32_t *wet_cells, *wet_cols, *liq_cols, *col_spmask, *wet_count, *wet_col_count, *liq_col_count;
+    int *col_ktop, *col_liq_ktop, *col_w_ktop;
+    uint8_t *cell_flag;
 };
 
 KOKKOS_INLINE_FUNCTION uint32_t pack_cell(int ij, int k, int l) {
@@ -311,28 +313,40 @@ struct KokkosState {
 
 struct KokkosWorkspace {
     ViewD1 Vt, kv, zdis_m, rceff, rctop;
-    ViewU32 wet_cells, wet_cols, col_spmask, wet_count, wet_col_count;
-    ViewI32 col_ktop;
+    ViewU32 wet_cells, wet_cols, liq_cols, col_spmask, wet_count, wet_col_count, liq_col_count;
+    ViewI32 col_ktop, col_liq_ktop, col_w_ktop;
+    ViewU8 cell_flag;
     Kokkos::View<WorkPtrs, MemSpace> d_W;
     const WorkPtrs* dp;
 
     void init(int ijdim, int kdim, int lall) {
         size_t n3 = (size_t)ijdim * kdim * lall;
         size_t n2 = (size_t)ijdim * lall;
+        size_t n_zc = ((n2 + 63ULL) / 64ULL) * 64ULL * 4ULL * (size_t)kdim;
         Vt            = ViewD1("Vt", 4 * n3);
         kv            = ViewD1("kv", n3);
-        zdis_m        = ViewD1("zdis_m", 4 * n3);
+        zdis_m        = ViewD1("zdis_m", n_zc);
         rceff         = ViewD1("rceff", n3);
         rctop         = ViewD1("rctop", n2);
         wet_cells     = ViewU32("wet_cells", n3);
         wet_cols      = ViewU32("wet_cols", n2);
+        liq_cols      = ViewU32("liq_cols", n2);
         col_spmask    = ViewU32("col_spmask", n2);
         col_ktop      = ViewI32("col_ktop", n2);
+        col_liq_ktop  = ViewI32("col_liq_ktop", n2);
+        col_w_ktop    = ViewI32("col_w_ktop", n2);
         wet_count     = ViewU32("wet_count", 1);
         wet_col_count = ViewU32("wet_col_count", 1);
+        liq_col_count = ViewU32("liq_col_count", 1);
+        cell_flag     = ViewU8("cell_flag", n3);
+        // Boundary slices k=0, k=kdim-1 permanently stay flag=1, Vt=0, kv=0!
+        Kokkos::deep_copy(cell_flag, (uint8_t)1u);
+        Kokkos::deep_copy(Vt, 0.0);
+        Kokkos::deep_copy(kv, 0.0);
         WorkPtrs wp = { Vt.data(), kv.data(), zdis_m.data(), rceff.data(), rctop.data(),
-                        wet_cells.data(), wet_cols.data(), col_spmask.data(),
-                        wet_count.data(), wet_col_count.data(), col_ktop.data() };
+                        wet_cells.data(), wet_cols.data(), liq_cols.data(), col_spmask.data(),
+                        wet_count.data(), wet_col_count.data(), liq_col_count.data(),
+                        col_ktop.data(), col_liq_ktop.data(), col_w_ktop.data(), cell_flag.data() };
         d_W = Kokkos::View<WorkPtrs, MemSpace>("d_W");
         auto h_W = Kokkos::create_mirror_view(d_W);
         h_W() = wp;
@@ -858,8 +872,11 @@ static void run_kokkos_mode1(const ExecSpace& exec, const NSW6Params* dP, int ij
 }
 
 // =============================================================================
-// MODE 2 (Kokkos-MATH) & MODE 3 (Kokkos-MONO):
-//   100% Pure Portable Kokkos + TeamPolicy Scratch Compaction + 3 Math Theorems
+// MODE 2 (Kokkos-MATH v5) & MODE 3 (Kokkos-MONO v5):
+//   100% Pure Portable Kokkos 4.7 + TeamPolicy Scratch Compaction +
+//   All 4 Math Theorems (Dyadic Snow, Fubini+Monotone, Laguerre-4, Clausius-Clapeyron
+//   Perturbation-Robust Dry Certificate) + Zero 426 MB Vt Reset + Fused screen+init_kv
+//   + Zero-vx/vy/vz Precip_Full + L2-Coalesced zdis_m + Sparse rceff & diag_w!
 // =============================================================================
 template <int OPT_MODE>
 static void run_kokkos_math(const ExecSpace& exec, const NSW6Params* dP, int ijdim, int kdim, int lall, int do_rc,
@@ -869,116 +886,190 @@ static void run_kokkos_math(const ExecSpace& exec, const NSW6Params* dP, int ijd
     const size_t s3 = (size_t)ijdim * kdim, n3 = (size_t)lall * s3;
     const size_t n2 = (size_t)lall * ijdim, n_int = (size_t)lall * (size_t)kint * (size_t)ijdim;
 
-    // 0. Async zero via Kokkos::deep_copy(exec, ...) — ZERO host-device fences!
-    Kokkos::deep_copy(exec, WK.Vt, 0.0);
+    // 0. ZERO 426 MB Vt fill! Async zero ONLY tiny metadata (+ rceff if requested)!
     Kokkos::deep_copy(exec, WK.col_spmask, 0u);
     Kokkos::deep_copy(exec, WK.col_ktop, 0);
+    Kokkos::deep_copy(exec, WK.col_w_ktop, 0);
     Kokkos::deep_copy(exec, WK.wet_count, 0u);
     Kokkos::deep_copy(exec, WK.wet_col_count, 0u);
+    if (do_rc) {
+        Kokkos::deep_copy(exec, WK.col_liq_ktop, 0);
+        Kokkos::deep_copy(exec, WK.liq_col_count, 0u);
+        Kokkos::deep_copy(exec, WK.rceff, 0.0);
+    }
 
-    // 1A. Portable Kokkos::TeamPolicy Dry-Cell Screen + Team-Aggregated Compaction
+    // 1A. Portable TeamPolicy Fused Screen + Clausius-Clapeyron Cert + init_kv!
+    //     32-bit uniform (l, k, ij_base) per team (ZERO 64-bit divs!), __restrict__
+    //     pointers, and 8-bank warp-striped scratch counters (68 B smem, 8x less contention!)
     constexpr int TSIZE = 256;
-    const int n_teams_int = (int)((n_int + TSIZE - 1) / TSIZE);
-    const size_t shmem_b  = ScratchU32::shmem_size(2);
+    const int n_ij_teams  = (ijdim + TSIZE - 1) / TSIZE;
+    const int n_teams_int = lall * kint * n_ij_teams;
+    const size_t shmem_scr = ScratchU32::shmem_size(17);
+    using ScreenPolicy = Kokkos::TeamPolicy<ExecSpace, Kokkos::LaunchBounds<256, 4>>;
     Kokkos::parallel_for("km_screen",
-        TeamPolicy(exec, n_teams_int, TSIZE).set_scratch_size(0, Kokkos::PerTeam(shmem_b)),
-        KOKKOS_LAMBDA(const TeamMember& team) {
+        ScreenPolicy(exec, n_teams_int, TSIZE).set_scratch_size(0, Kokkos::PerTeam(shmem_scr)),
+        KOKKOS_LAMBDA(const ScreenPolicy::member_type& team) {
             const NSW6Params& P = *dP; const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
-            ScratchU32 s_meta(team.team_scratch(0), 2);
-            Kokkos::single(Kokkos::PerTeam(team), [&]() { s_meta(0) = 0u; });
+            ScratchU32 s_buf(team.team_scratch(0), 17); // [0..7]=cnt, [8..15]=off, [16]=base
+            const int tid = team.team_rank();
+            if (tid < 8) s_buf(tid) = 0u;
             team.team_barrier();
 
-            const size_t gid = (size_t)team.league_rank() * TSIZE + (size_t)team.team_rank();
+            const int lr = team.league_rank();
+            const int l  = lr / (kint * n_ij_teams);
+            const int r1 = lr - l * (kint * n_ij_teams);
+            const int k  = (r1 / n_ij_teams) + kmin0;
+            const int ij = (r1 - (k - kmin0) * n_ij_teams) * TSIZE + tid;
+
             bool is_wet = false;
             uint32_t packed = 0u;
-            if (gid < n_int) {
-                const size_t s_int = (size_t)kint * ijdim;
-                const int l  = (int)(gid / s_int);
-                const size_t rem = gid - (size_t)l * s_int;
-                const int k  = (int)(rem / (size_t)ijdim) + kmin0;
-                const int ij = (int)(rem - (size_t)(k - kmin0) * ijdim);
+            if (ij < ijdim) {
                 const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
                 const size_t idx  = (size_t)ij + (size_t)k * ijdim;
 
-                const double* rhogq = S.rhogq + off4;
+                const double* __restrict__ rhogq = S.rhogq + off4;
+                const double* __restrict__ rhog  = S.rhog + off3;
+                const double* __restrict__ gs2_a = S.gsgam2 + off3;
+                const double* __restrict__ tem_a = S.tem + off3;
+
                 bool no_hyd = (rhogq[idx + P.i_qc*s3] == 0.0 && rhogq[idx + P.i_qr*s3] == 0.0 &&
                                rhogq[idx + P.i_qi*s3] == 0.0 && rhogq[idx + P.i_qs*s3] == 0.0 &&
                                rhogq[idx + P.i_qg*s3] == 0.0);
-                double rg = S.rhog[off3 + idx], temp = S.tem[off3 + idx], rgqv = rhogq[idx + P.i_qv * s3];
+                double rg   = rhog[idx];
+                double temp = tem_a[idx];
+                double rgqv = rhogq[idx + P.i_qv * s3];
+                double gs2  = gs2_a[idx];
+
+                double kv_v = 0.0;
+                if (k > P.kmin0) {
+                    const double* __restrict__ rhogw  = S.rhogw + off3;
+                    const double* __restrict__ gs2h_a = S.gsgam2h + off3;
+                    double rw = rhogw[idx];
+                    if (rw != 0.0) {
+                        double rho_k  = rg / gs2;
+                        double rho_m1 = rhog[idx - ijdim] / gs2_a[idx - ijdim];
+                        double rhogh  = (S.afact[k] * rho_k + S.bfact[k] * rho_m1) * gs2h_a[idx];
+                        kv_v = 0.5 * rw * rw / rhogh;
+                    }
+                }
+
                 bool clean_dry = no_hyd && (rgqv >= 0.0);
+                bool cold_cert = false;
                 if (clean_dry && temp < P.TEM00) {
-                    double dens = rg / S.gsgam2[off3 + idx], qv = rgqv / rg;
+                    double dens = rg / gs2, qv = rgqv / rg;
                     double tc = (temp > 10.0) ? temp : 10.0;
                     double psati = P.PSAT0 * exp(P.LovR_ice * (1.0 / P.TEM00 - 1.0 / tc));
                     if (qv > psati / (dens * P.Rvap * temp)) clean_dry = false;
+                    else cold_cert = (temp >= 20.0 && temp <= P.TEM00 - 1.0);
                 }
+
+                // Coalesced stores at the end so all reads above pipeline cleanly!
+                if (k > P.kmin0) {
+                    double* __restrict__ kv_out = W.kv + off3;
+                    kv_out[idx] = kv_v;
+                }
+                uint8_t* __restrict__ flg_out = W.cell_flag + off3;
                 if (clean_dry) {
-                    S.rhoge[off3 + idx] = temp * rg * P.CVdry;
+                    flg_out[idx] = cold_cert ? (uint8_t)2u : (uint8_t)1u;
+                    double* __restrict__ rhoge_out = S.rhoge + off3;
+                    rhoge_out[idx] = temp * rg * P.CVdry;
                 } else {
+                    flg_out[idx] = (uint8_t)0u;
                     is_wet = true;
                     packed = pack_cell(ij, k, l);
                 }
             }
-            uint32_t local_pos = is_wet ? Kokkos::atomic_fetch_add(&s_meta(0), 1u) : 0u;
+            const int grp = tid >> 5; // 8 independent counters -> 8x lower atomic contention!
+            uint32_t local_pos = is_wet ? Kokkos::atomic_fetch_add(&s_buf(grp), 1u) : 0u;
             team.team_barrier();
-            Kokkos::single(Kokkos::PerTeam(team), [&]() {
-                if (s_meta(0) > 0u) s_meta(1) = Kokkos::atomic_fetch_add(&W.wet_count[0], s_meta(0));
-            });
+            if (tid == 0) {
+                uint32_t sum = 0u;
+                for (int g = 0; g < 8; ++g) { s_buf(8 + g) = sum; sum += s_buf(g); }
+                if (sum > 0u) s_buf(16) = Kokkos::atomic_fetch_add(&W.wet_count[0], sum);
+            }
             team.team_barrier();
-            if (is_wet) W.wet_cells[s_meta(1) + local_pos] = packed;
+            if (is_wet) W.wet_cells[s_buf(16) + s_buf(8 + grp) + local_pos] = packed;
         });
 
-    // 1B. Pure-Kokkos Wet-Cell Microphysics Core (Dyadic Roh-Satoh via nsw6_math_core.cuh!)
-    Kokkos::parallel_for("km_wet_core", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_int), KOKKOS_LAMBDA(const size_t p) {
-        const WorkPtrs& W = *dW;
-        if (p >= W.wet_count[0]) return;
-        const NSW6Params& P = *dP; const StatePtrs& S = *dS;
-        const uint32_t packed = W.wet_cells[p];
-        const int ij = (int)(packed & 0x3FFFFu);
-        const int k  = (int)((packed >> 18) & 0xFFu);
-        const int l  = (int)(packed >> 26);
+    // 1B. Pure-Kokkos Wet-Cell Microphysics Core (portable LaunchBounds<128, 2>!)
+    Kokkos::parallel_for("km_wet_core",
+        Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<128, 2>>(exec, 0, n_int),
+        KOKKOS_LAMBDA(const size_t p) {
+            const WorkPtrs& W = *dW;
+            if (p >= W.wet_count[0]) return;
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS;
+            const uint32_t packed = W.wet_cells[p];
+            const int ij = (int)(packed & 0x3FFFFu);
+            const int k  = (int)((packed >> 18) & 0xFFu);
+            const int l  = (int)(packed >> 26);
 
-        const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
-        const size_t off2 = (size_t)l * ijdim, offv = (size_t)l * 4ULL * s3;
-        const size_t idx  = (size_t)ij + (size_t)k * ijdim;
+            const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
+            const size_t off2 = (size_t)l * ijdim, offv = (size_t)l * 4ULL * s3;
+            const size_t idx  = (size_t)ij + (size_t)k * ijdim;
+            const size_t col  = off2 + (size_t)ij;
 
-        int d0=0, d1=0, d2=0, d3=0, d4=0;
-        nsw6_pre_and_core_cell(P, ij, k, S.rhog+off3, S.rhoge+off3, S.rhogq+off4,
-            S.rho+off3, S.tem+off3, S.pre+off3, S.q+off4, S.w+off3,
-            S.unccn+off3, S.factor_n_aie+off2, S.gsgam2+off3, W.Vt+offv,
-            &d0,&d1,&d2,&d3,&d4);
+            const double rg_before = S.rhog[off3 + idx];
+            int d0=0, d1=0, d2=0, d3=0, d4=0;
+            nsw6_pre_and_core_cell(P, ij, k, S.rhog+off3, S.rhoge+off3, S.rhogq+off4,
+                S.rho+off3, S.tem+off3, S.pre+off3, S.q+off4, S.w+off3,
+                S.unccn+off3, S.factor_n_aie+off2, S.gsgam2+off3, W.Vt+offv,
+                &d0,&d1,&d2,&d3,&d4);
 
-        const double* rhogq = S.rhogq + off4;
-        uint32_t spm = (rhogq[idx + P.i_qr*s3] > 0.0 ? 1u : 0u)
-                     | ((P.precip_4water && rhogq[idx + P.i_qi*s3] > 0.0) ? 2u : 0u)
-                     | (rhogq[idx + P.i_qs*s3] > 0.0 ? 4u : 0u)
-                     | (rhogq[idx + P.i_qg*s3] > 0.0 ? 8u : 0u);
-        if (spm) {
-            size_t col = off2 + (size_t)ij;
-            if ((W.col_spmask[col] & spm) != spm) Kokkos::atomic_or(&W.col_spmask[col], spm);
-            if (k > W.col_ktop[col])              Kokkos::atomic_max(&W.col_ktop[col], k);
-        }
-    });
+            if (S.rhog[off3 + idx] != rg_before) {
+                double rg_new = S.rhog[off3 + idx];
+                S.vx[off3 + idx] = S.rhogvx[off3 + idx] / rg_new;
+                S.vy[off3 + idx] = S.rhogvy[off3 + idx] / rg_new;
+                S.vz[off3 + idx] = S.rhogvz[off3 + idx] / rg_new;
+                if (W.col_w_ktop[col] < P.kmax0) W.col_w_ktop[col] = P.kmax0;
+            }
 
-    if (do_rc) kokkos_rceff_whole(exec, dP, ijdim, kdim, lall, dS, dW);
-    kokkos_init_kv(exec, dP, ijdim, kdim, lall, dS, dW);
+            const double* rhogq = S.rhogq + off4;
+            const double rgqc = rhogq[idx + P.i_qc*s3];
+            const double rgqr = rhogq[idx + P.i_qr*s3];
+            if (do_rc && (rgqc > 0.0 || rgqr > 0.0)) {
+                if (k > W.col_liq_ktop[col]) Kokkos::atomic_max(&W.col_liq_ktop[col], k);
+            }
+            uint32_t spm = (rgqr > 0.0 ? 1u : 0u)
+                         | ((P.precip_4water && rhogq[idx + P.i_qi*s3] > 0.0) ? 2u : 0u)
+                         | (rhogq[idx + P.i_qs*s3] > 0.0 ? 4u : 0u)
+                         | (rhogq[idx + P.i_qg*s3] > 0.0 ? 8u : 0u);
+            if (spm) {
+                if ((W.col_spmask[col] & spm) != spm) Kokkos::atomic_or(&W.col_spmask[col], spm);
+                if (k > W.col_ktop[col])              Kokkos::atomic_max(&W.col_ktop[col], k);
+            }
+        });
 
-    // 1C. Portable TeamPolicy Precipitating-Column Compaction
+    // 1C. Portable TeamPolicy Wet-Col + Liquid-Col Compaction (+ rare clipped-col kv repair)
     const int n_teams_col = (int)((n2 + TSIZE - 1) / TSIZE);
+    const size_t shmem_c  = ScratchU32::shmem_size(4);
     Kokkos::parallel_for("km_compact_cols",
-        TeamPolicy(exec, n_teams_col, TSIZE).set_scratch_size(0, Kokkos::PerTeam(shmem_b)),
+        TeamPolicy(exec, n_teams_col, TSIZE).set_scratch_size(0, Kokkos::PerTeam(shmem_c)),
         KOKKOS_LAMBDA(const TeamMember& team) {
-            const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
-            ScratchU32 s_meta(team.team_scratch(0), 2);
-            Kokkos::single(Kokkos::PerTeam(team), [&]() { s_meta(0) = 0u; });
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
+            ScratchU32 s_meta(team.team_scratch(0), 4);
+            Kokkos::single(Kokkos::PerTeam(team), [&]() { s_meta(0) = 0u; s_meta(2) = 0u; });
             team.team_barrier();
 
             const size_t col = (size_t)team.league_rank() * TSIZE + (size_t)team.team_rank();
-            bool is_wet = false;
+            bool is_wet = false, is_liq = false;
             uint32_t packed = 0u;
             if (col < n2) {
                 const int l  = (int)(col / (size_t)ijdim);
                 const int ij = (int)(col - (size_t)l * ijdim);
+                packed = pack_col(ij, l);
+                if (W.col_w_ktop[col] != 0) {
+                    const size_t off3 = (size_t)l * s3;
+                    for (int k = P.kmin0 + 1; k <= P.kmax0; ++k) {
+                        size_t idx = (size_t)ij + (size_t)k * ijdim;
+                        double rw = S.rhogw[off3 + idx], kv_v = 0.0;
+                        if (rw != 0.0) {
+                            double rhogh = (S.afact[k]*(S.rhog[off3+idx]/S.gsgam2[off3+idx])
+                                          + S.bfact[k]*(S.rhog[off3+idx-ijdim]/S.gsgam2[off3+idx-ijdim])) * S.gsgam2h[off3+idx];
+                            kv_v = 0.5 * rw * rw / rhogh;
+                        }
+                        W.kv[off3 + idx] = kv_v;
+                    }
+                }
                 if (W.col_spmask[col] == 0u) {
                     const size_t offp = (size_t)l * 2ULL * (size_t)ijdim;
                     S.precip[offp + ij] = 0.0; S.precip[offp + ij + ijdim] = 0.0;
@@ -986,386 +1077,594 @@ static void run_kokkos_math(const ExecSpace& exec, const NSW6Params* dP, int ijd
                     S.precip_rhophi[col] = 0.0; S.precip_rhokin[col] = 0.0; S.precip_energy[col] = 0.0;
                 } else {
                     is_wet = true;
-                    packed = pack_col(ij, l);
+                }
+                if (do_rc) {
+                    if (W.col_liq_ktop[col] != 0) is_liq = true;
+                    else                          W.rctop[col] = P.UNDEF;
                 }
             }
-            uint32_t local_pos = is_wet ? Kokkos::atomic_fetch_add(&s_meta(0), 1u) : 0u;
+            uint32_t wpos = is_wet ? Kokkos::atomic_fetch_add(&s_meta(0), 1u) : 0u;
+            uint32_t lpos = is_liq ? Kokkos::atomic_fetch_add(&s_meta(2), 1u) : 0u;
             team.team_barrier();
             Kokkos::single(Kokkos::PerTeam(team), [&]() {
                 if (s_meta(0) > 0u) s_meta(1) = Kokkos::atomic_fetch_add(&W.wet_col_count[0], s_meta(0));
+                if (s_meta(2) > 0u) s_meta(3) = Kokkos::atomic_fetch_add(&W.liq_col_count[0], s_meta(2));
             });
             team.team_barrier();
-            if (is_wet) W.wet_cols[s_meta(1) + local_pos] = packed;
+            if (is_wet) W.wet_cols[s_meta(1) + wpos] = packed;
+            if (is_liq) W.liq_cols[s_meta(3) + lpos] = packed;
         });
 
-    // 2A. Pure-Kokkos Fubini Half-Level Sedimentation (+ optional O(K) Monotone)
-    Kokkos::parallel_for("km_precip_h", Kokkos::RangePolicy<ExecSpace>(exec, 0, n2), KOKKOS_LAMBDA(const size_t p) {
-        const WorkPtrs& W = *dW;
-        if (p >= W.wet_col_count[0]) return;
-        const NSW6Params& P = *dP; const StatePtrs& S = *dS;
-        const uint32_t pc = W.wet_cols[p];
-        const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
-        const size_t col = (size_t)l * ijdim + ij;
-        const uint32_t sp_mask = W.col_spmask[col];
-        const int k_top = W.col_ktop[col], k_hi = (k_top + 1 <= P.kmax0) ? (k_top + 1) : P.kmax0;
-        const int sp_nq[4] = { P.i_qr, P.i_qi, P.i_qs, P.i_qg };
-        const double dt = P.dt;
-        const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3, offv = (size_t)l * 4ULL * s3;
-        double *rhogw = S.rhogw + off3, *kv = W.kv + off3;
-        const double *q = S.q + off4, *z = S.z + off3, *zh = S.zh + off3;
-        const double *gs2h = S.gsgam2h + off3, *g2h = S.gam2h + off3, *Vt = W.Vt + offv;
-        const double dzh_kmin = z[ij + P.kmin0 * ijdim] - zh[ij + P.kmin0 * ijdim];
-        double* zd_m = (OPT_MODE == 3) ? (W.zdis_m + offv) : nullptr;
-
-        if constexpr (OPT_MODE == 3) {
-            for (int s = 0; s < 4; ++s) {
-                if (!(sp_mask & (1u << s))) continue;
-                double xi_next = z[ij + (size_t)k_hi * ijdim];
-                for (int k = k_hi; k >= P.kmin0 + 1; --k) {
+    // 1D. Compacted Liquid-Only rceff + 19-us Sparse Vt Zeroing on Dry Gaps of Wet Cols!
+    if (do_rc) {
+        Kokkos::parallel_for("km_rceff",
+            Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<64, 6>>(exec, 0, n2),
+            KOKKOS_LAMBDA(const size_t p) {
+                const WorkPtrs& W = *dW;
+                if (p >= W.liq_col_count[0]) return;
+                const NSW6Params& P = *dP; const StatePtrs& S = *dS;
+                const uint32_t pc = W.liq_cols[p];
+                const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
+                const size_t col = (size_t)l * ijdim + ij;
+                const int liq_top = W.col_liq_ktop[col];
+                const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
+                const double *rho = S.rho + off3, *q = S.q + off4;
+                const uint8_t *flg = W.cell_flag + off3;
+                double *rceff_out = W.rceff + off3;
+                const double faie = S.factor_n_aie[col], Nc_base = P.Nc_def * faie;
+                double rctop = P.UNDEF;
+                for (int k = P.kmin0; k <= liq_top; ++k) {
                     size_t idx = (size_t)ij + (size_t)k * ijdim;
-                    double wk = Vt[idx + s * s3], d_raw = 0.0, z_km1 = z[idx - ijdim];
-                    if (wk != 0.0) {
-                        double dzh_k = z[idx] - z_km1;
-                        double dzh_km1 = (k - 1 == P.kmin0) ? dzh_kmin : (z_km1 - z[idx - 2ULL * ijdim]);
-                        d_raw = vadv1d_taylor_zdis(wk, Vt[idx+ijdim+s*s3], Vt[idx-ijdim+s*s3], dzh_k, dzh_km1, dzh_k+dzh_km1, dt, k == P.kmin0 + 1);
+                    if (flg[idx] != 0u) continue;
+                    double qc = q[idx + P.i_qc * s3], qr = q[idx + P.i_qr * s3];
+                    if (qc <= 0.0 && qr <= 0.0) continue;
+                    if (qc < 0.0) qc = 0.0; if (qr < 0.0) qr = 0.0;
+                    double dens = rho[idx];
+                    double Nc_v = P.opt_indir ? fmax(S.unccn[off3+idx]*1.0e-6*faie, P.Nc_def) : Nc_base;
+                    double r2_qc;
+                    if (qc > 0.0) {
+                        double xf_qc = (dens * qc * 1000.0) / Nc_v * 1.0e-9;
+                        double rf_qc = cbrt(P.rceff_coef_xf * xf_qc + 1.0e-16);
+                        r2_qc = P.rceff_coef_dgam * rf_qc * rf_qc * (Nc_v * 1.0e6);
+                    } else {
+                        constexpr double RF0_SQ = 2.1544346900318837e-11;
+                        r2_qc = P.rceff_coef_dgam * RF0_SQ * (Nc_v * 1.0e6);
                     }
-                    double xi_k = z_km1 + d_raw;
-                    double xi_p = (xi_k < xi_next) ? xi_k : xi_next;
-                    double d_p  = xi_p - z_km1;
-                    zd_m[idx + s * s3] = (d_p > 0.0) ? d_p : 0.0;
-                    xi_next = xi_p;
+                    double RLMDr = (qr >= 1.0e-12) ? sqrt(sqrt(dens * qr / (P.Ar * P.N0r * P.GAM_1br))) : 0.0;
+                    double r2_qr = 0.25 * P.N0r * P.GAM_3 * (RLMDr * RLMDr * RLMDr);
+                    double r3_sum = P.rceff_coef_xf * dens * (qc + qr);
+                    double r2_sum = r2_qc + r2_qr;
+                    double rc = (r2_sum >= 1.0e-10) ? (r3_sum / r2_sum) : 0.0;
+                    if (rc != 0.0) rceff_out[idx] = rc;
+                    if ((qc + qr) >= 1.0e-5) rctop = rc;
+                }
+                W.rctop[col] = rctop;
+            });
+    }
+
+    Kokkos::parallel_for("km_clean_vt",
+        Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<128, 6>>(exec, 0, n2),
+        KOKKOS_LAMBDA(const size_t p) {
+            const WorkPtrs& W = *dW;
+            if (p >= W.wet_col_count[0]) return;
+            const NSW6Params& P = *dP;
+            const uint32_t pc = W.wet_cols[p];
+            const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
+            const size_t col = (size_t)l * ijdim + ij;
+            const int k_top = W.col_ktop[col];
+            const int k_lim = (k_top + 2 <= P.kmax0) ? (k_top + 2) : P.kmax0;
+            const size_t off3 = (size_t)l * s3, offv = (size_t)l * 4ULL * s3;
+            const uint8_t* flg = W.cell_flag + off3;
+            double* Vt = W.Vt + offv;
+            for (int k = P.kmin0; k <= k_lim; ++k) {
+                size_t idx = (size_t)ij + (size_t)k * ijdim;
+                if (flg[idx] != 0u) {
+                    Vt[idx + 0*s3] = 0.0; Vt[idx + 1*s3] = 0.0;
+                    Vt[idx + 2*s3] = 0.0; Vt[idx + 3*s3] = 0.0;
                 }
             }
-        }
+        });
 
-        double prev_fkv = 0.0, prev_fw = 0.0;
-        for (int k = P.kmin0 + 1; k <= k_hi; ++k) {
-            size_t kdx = (size_t)ij + (size_t)k * ijdim;
-            double z_k = z[kdx], z_km1 = z[kdx - ijdim], dzh_k = z_k - z_km1;
-            double dzh_km1 = (k - 1 == P.kmin0) ? dzh_kmin : (z_km1 - z[kdx - 2ULL * ijdim]);
-            int kc[4] = { k-1, k-1, k-1, k-1 }, c_max = k - 1;
-            double rem[4] = { 0, 0, 0, 0 };
-            for (int s = 0; s < 4; ++s) {
-                if (!(sp_mask & (1u << s))) continue;
-                double zdis;
-                if constexpr (OPT_MODE == 3) zdis = zd_m[kdx + s * s3];
-                else {
-                    double wk = Vt[kdx + s * s3]; if (wk == 0.0) continue;
-                    zdis = vadv1d_taylor_zdis(wk, Vt[kdx+ijdim+s*s3], Vt[kdx-ijdim+s*s3], dzh_k, dzh_km1, dzh_k+dzh_km1, dt, k == P.kmin0 + 1);
-                }
-                if (zdis <= 0.0) continue;
-                double ztmp = z_km1 + zdis;
-                if (ztmp <= z_k) { kc[s] = k; rem[s] = zdis; if (k > c_max) c_max = k; }
-                else {
-                    int c = k; double z_lo_c = z_km1;
-                    for (int j = k + 1; j <= P.kmax0; ++j) {
-                        double zj = z[(size_t)ij + (size_t)j * ijdim];
-                        if (ztmp <= zj) {
-                            double zjm1 = z[(size_t)ij + (size_t)(j - 1) * ijdim];
-                            if (ztmp > zjm1) { c = j; z_lo_c = zjm1; }
-                            break;
+    // 2A. Pure-Kokkos Fubini Half-Level Sedimentation (+ L2-Coalesced Mode 3!)
+    Kokkos::parallel_for("km_precip_h",
+        Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<64, 6>>(exec, 0, n2),
+        KOKKOS_LAMBDA(const size_t p) {
+            const WorkPtrs& W = *dW;
+            if (p >= W.wet_col_count[0]) return;
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS;
+            const uint32_t pc = W.wet_cols[p];
+            const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
+            const size_t col = (size_t)l * ijdim + ij;
+            const uint32_t sp_mask = W.col_spmask[col];
+            const int k_top = W.col_ktop[col], k_hi = (k_top + 1 <= P.kmax0) ? (k_top + 1) : P.kmax0;
+            const int sp_nq[4] = { P.i_qr, P.i_qi, P.i_qs, P.i_qg };
+            const double dt = P.dt;
+            const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3, offv = (size_t)l * 4ULL * s3;
+            double *rhogw = S.rhogw + off3, *kv = W.kv + off3;
+            const double *q = S.q + off4, *z = S.z + off3, *zh = S.zh + off3;
+            const double *gs2h = S.gsgam2h + off3, *g2h = S.gam2h + off3, *Vt = W.Vt + offv;
+            const double dzh_kmin = z[ij + P.kmin0 * ijdim] - zh[ij + P.kmin0 * ijdim];
+            double* zd_c = (OPT_MODE == 3)
+                ? (W.zdis_m + ((p >> 6) * (size_t)kdim * 4ULL) * 64ULL + (p & 63ULL))
+                : nullptr;
+
+            if constexpr (OPT_MODE == 3) {
+                for (int s = 0; s < 4; ++s) {
+                    if (!(sp_mask & (1u << s))) continue;
+                    size_t idx_hi = (size_t)ij + (size_t)k_hi * ijdim;
+                    double xi_next = z[idx_hi], z_0 = xi_next;
+                    double w_p1 = Vt[idx_hi + ijdim + s * s3], w_0 = Vt[idx_hi + s * s3];
+                    for (int k = k_hi; k >= P.kmin0 + 1; --k) {
+                        size_t idx = (size_t)ij + (size_t)k * ijdim;
+                        double w_m1 = Vt[idx - ijdim + s * s3], z_m1 = z[idx - ijdim], d_raw = 0.0;
+                        if (w_0 != 0.0) {
+                            double dzh_k = z_0 - z_m1;
+                            double dzh_km1 = (k - 1 == P.kmin0) ? dzh_kmin : (z_m1 - z[idx - 2ULL * ijdim]);
+                            d_raw = vadv1d_taylor_zdis(w_0, w_p1, w_m1, dzh_k, dzh_km1, dzh_k + dzh_km1, dt, k == P.kmin0 + 1);
                         }
+                        double xi_k = z_m1 + d_raw;
+                        double xi_p = (xi_k < xi_next) ? xi_k : xi_next;
+                        double d_p  = xi_p - z_m1;
+                        zd_c[((size_t)k * 4ULL + (size_t)s) * 64ULL] = (d_p > 0.0) ? d_p : 0.0;
+                        xi_next = xi_p; w_p1 = w_0; w_0 = w_m1; z_0 = z_m1;
                     }
-                    kc[s] = c; rem[s] = zdis - (z_lo_c - z_km1);
-                    if (c > c_max) c_max = c;
                 }
             }
-            double fkv_k = 0.0, fw_k = 0.0;
-            if (c_max == k) {
-                size_t jm1 = kdx - ijdim;
-                double af = S.afact[k], bf = S.bfact[k], Wh = 0.0;
-                for (int s = 0; s < 4; ++s) if (kc[s] == k) Wh += rem[s] * (af * q[kdx + sp_nq[s]*s3] + bf * q[jm1 + sp_nq[s]*s3]);
-                if (Wh != 0.0) { double wr = Wh * (g2h[kdx] / gs2h[kdx]); fkv_k = -wr * kv[kdx]; fw_k = -wr * rhogw[kdx]; }
-            } else if (c_max > k) {
-                int j_end = (c_max <= k_hi) ? c_max : k_hi;
-                for (int j = k; j <= j_end; ++j) {
-                    size_t jdx = (size_t)ij + (size_t)j * ijdim, jm1 = jdx - ijdim;
-                    double dj = z[jdx] - z[jm1], af = S.afact[j], bf = S.bfact[j], Wh = 0.0;
-                    for (int s = 0; s < 4; ++s) {
-                        int c = kc[s]; if (c < j) continue;
-                        double L = (j < c) ? dj : rem[s];
-                        Wh += L * (af * q[jdx + sp_nq[s]*s3] + bf * q[jm1 + sp_nq[s]*s3]);
+
+            double prev_fkv = 0.0, prev_fw = 0.0;
+            for (int k = P.kmin0 + 1; k <= k_hi; ++k) {
+                size_t kdx = (size_t)ij + (size_t)k * ijdim;
+                double z_k = z[kdx], z_km1 = z[kdx - ijdim], dzh_k = z_k - z_km1;
+                double dzh_km1 = (k - 1 == P.kmin0) ? dzh_kmin : (z_km1 - z[kdx - 2ULL * ijdim]);
+                int kc[4] = { k-1, k-1, k-1, k-1 }, c_max = k - 1;
+                double rem[4] = { 0, 0, 0, 0 };
+                for (int s = 0; s < 4; ++s) {
+                    if (!(sp_mask & (1u << s))) continue;
+                    double zdis;
+                    if constexpr (OPT_MODE == 3) zdis = zd_c[((size_t)k * 4ULL + (size_t)s) * 64ULL];
+                    else {
+                        double wk = Vt[kdx + s * s3]; if (wk == 0.0) continue;
+                        zdis = vadv1d_taylor_zdis(wk, Vt[kdx+ijdim+s*s3], Vt[kdx-ijdim+s*s3], dzh_k, dzh_km1, dzh_k+dzh_km1, dt, k == P.kmin0 + 1);
                     }
-                    if (Wh != 0.0) { double wr = Wh * (g2h[jdx] / gs2h[jdx]); fkv_k -= wr * kv[jdx]; fw_k -= wr * rhogw[jdx]; }
-                }
-            }
-            if (fkv_k != 0.0 || prev_fkv != 0.0 || fw_k != 0.0 || prev_fw != 0.0) {
-                kv[kdx]    -= (fkv_k - prev_fkv) * S.rdgzh[k];
-                rhogw[kdx] -= (fw_k  - prev_fw)  * S.rdgzh[k];
-            }
-            prev_fkv = fkv_k; prev_fw = fw_k;
-        }
-    });
-
-    // 2B. Pure-Kokkos Fubini Full-Level Sedimentation (+ optional O(K) Monotone)
-    Kokkos::parallel_for("km_precip_f", Kokkos::RangePolicy<ExecSpace>(exec, 0, n2), KOKKOS_LAMBDA(const size_t p) {
-        const WorkPtrs& W = *dW;
-        if (p >= W.wet_col_count[0]) return;
-        const NSW6Params& P = *dP; const StatePtrs& S = *dS;
-        const uint32_t pc = W.wet_cols[p];
-        const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
-        const size_t col = (size_t)l * ijdim + ij;
-        const uint32_t sp_mask = W.col_spmask[col];
-        const int k_hi = W.col_ktop[col];
-        const int sp_nq[4] = { P.i_qr, P.i_qi, P.i_qs, P.i_qg };
-        const double dt = P.dt, inv_dt = 1.0 / dt;
-        const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
-        const size_t offp = (size_t)l * 2ULL * (size_t)ijdim, offv = (size_t)l * 4ULL * s3;
-
-        double *rhog = S.rhog+off3, *rhogvx = S.rhogvx+off3, *rhogvy = S.rhogvy+off3, *rhogvz = S.rhogvz+off3;
-        double *rhoge = S.rhoge+off3, *rhogq = S.rhogq+off4;
-        const double *rhogw = S.rhogw+off3, *tem = S.tem+off3, *vx = S.vx+off3, *vy = S.vy+off3, *vz = S.vz+off3;
-        const double *z = S.z+off3, *zh = S.zh+off3, *gs2 = S.gsgam2+off3, *gs2h = S.gsgam2h+off3, *g2 = S.gam2+off3;
-        const double *Vt = W.Vt+offv, *kv = W.kv+off3;
-        const double ix_c = S.ix[col], iy_c = S.iy[col], iz_c = S.iz[col];
-        const double jx_c = S.jx[col], jy_c = S.jy[col], jz_c = S.jz[col];
-
-        auto ew = [&](int k, int s) {
-            if (k == P.kmin0) return Vt[ij + P.kmin0*ijdim + s*s3];
-            if (k >  P.kmax0) return Vt[ij + P.kmax0*ijdim + s*s3];
-            size_t idx = (size_t)ij + (size_t)k*ijdim;
-            return S.afact[k]*Vt[idx+s*s3] + S.bfact[k]*Vt[idx-ijdim+s*s3];
-        };
-        auto ez = [&](int k, int s) {
-            double wk = ew(k, s); if (wk == 0.0) return 0.0;
-            size_t idx = (size_t)ij + (size_t)k*ijdim;
-            double zhk = zh[idx], dzk = zh[idx+ijdim] - zhk, dzm1 = (k>P.kmin0)?(zhk-zh[idx-ijdim]):dzk;
-            return vadv1d_taylor_zdis(wk, ew(k+1,s), (k>P.kmin0)?ew(k-1,s):0.0, dzk, dzm1, dzk+dzm1, dt, k==P.kmin0);
-        };
-        double* zd_m = (OPT_MODE == 3) ? (W.zdis_m + offv) : nullptr;
-        if constexpr (OPT_MODE == 3) {
-            for (int s = 0; s < 4; ++s) {
-                if (!(sp_mask & (1u << s))) continue;
-                double xi_next = zh[ij + (size_t)(k_hi + 1) * ijdim];
-                for (int k = k_hi; k >= P.kmin0; --k) {
-                    size_t idx = (size_t)ij + (size_t)k * ijdim;
-                    double zhk = zh[idx], xi_k = zhk + ez(k, s);
-                    double xi_p = (xi_k < xi_next) ? xi_k : xi_next;
-                    double d_p = xi_p - zhk;
-                    zd_m[idx + s * s3] = (d_p > 0.0) ? d_p : 0.0;
-                    xi_next = xi_p;
-                }
-            }
-        }
-
-        auto eif = [&](int ki, double fq[4], double& fe, double& fp, double& fk, double& fu, double& fv) {
-            fq[0]=fq[1]=fq[2]=fq[3]=0; fe=fp=fk=fu=fv=0;
-            if (ki > k_hi) return;
-            size_t kdx = (size_t)ij + (size_t)ki*ijdim;
-            double zki = zh[kdx], zkp1 = zh[kdx + ijdim];
-            int kc[4] = { ki-1, ki-1, ki-1, ki-1 }, c_max = ki - 1;
-            double rem[4] = { 0, 0, 0, 0 };
-            for (int s = 0; s < 4; ++s) {
-                if (!(sp_mask & (1u << s))) continue;
-                double zdis = (OPT_MODE == 3) ? zd_m[kdx + s * s3] : ez(ki, s);
-                if (zdis <= 0.0) continue;
-                double ztmp = zki + zdis;
-                if (ztmp <= zkp1) { kc[s] = ki; rem[s] = zdis; if (ki > c_max) c_max = ki; }
-                else {
-                    int c = ki; double zhc = zki;
-                    for (int j = ki + 1; j <= P.kmax0; ++j) {
-                        size_t jdx = (size_t)ij + (size_t)j * ijdim;
-                        if (ztmp <= zh[jdx + ijdim]) {
-                            double zj = zh[jdx]; if (ztmp > zj) { c = j; zhc = zj; } break;
+                    if (zdis <= 0.0) continue;
+                    double ztmp = z_km1 + zdis;
+                    if (ztmp <= z_k) { kc[s] = k; rem[s] = zdis; if (k > c_max) c_max = k; }
+                    else {
+                        int c = k; double z_lo_c = z_km1;
+                        for (int j = k + 1; j <= P.kmax0; ++j) {
+                            double zj = z[(size_t)ij + (size_t)j * ijdim];
+                            if (ztmp <= zj) {
+                                double zjm1 = z[(size_t)ij + (size_t)(j - 1) * ijdim];
+                                if (ztmp > zjm1) { c = j; z_lo_c = zjm1; }
+                                break;
+                            }
                         }
+                        kc[s] = c; rem[s] = zdis - (z_lo_c - z_km1);
+                        if (c > c_max) c_max = c;
                     }
-                    kc[s] = c; rem[s] = zdis - (zhc - zki);
-                    if (c > c_max) c_max = c;
+                }
+                double fkv_k = 0.0, fw_k = 0.0;
+                if (c_max == k) {
+                    size_t jm1 = kdx - ijdim;
+                    double af = S.afact[k], bf = S.bfact[k], Wh = 0.0;
+                    for (int s = 0; s < 4; ++s) if (kc[s] == k) Wh += rem[s] * (af * q[kdx + sp_nq[s]*s3] + bf * q[jm1 + sp_nq[s]*s3]);
+                    if (Wh != 0.0) { double wr = Wh * (g2h[kdx] / gs2h[kdx]); fkv_k = -wr * kv[kdx]; fw_k = -wr * rhogw[kdx]; }
+                } else if (c_max > k) {
+                    int j_end = (c_max <= k_hi) ? c_max : k_hi;
+                    for (int j = k; j <= j_end; ++j) {
+                        size_t jdx = (size_t)ij + (size_t)j * ijdim, jm1 = jdx - ijdim;
+                        double dj = z[jdx] - z[jm1], af = S.afact[j], bf = S.bfact[j], Wh = 0.0;
+                        for (int s = 0; s < 4; ++s) {
+                            int c = kc[s]; if (c < j) continue;
+                            double L = (j < c) ? dj : rem[s];
+                            Wh += L * (af * q[jdx + sp_nq[s]*s3] + bf * q[jm1 + sp_nq[s]*s3]);
+                        }
+                        if (Wh != 0.0) { double wr = Wh * (g2h[jdx] / gs2h[jdx]); fkv_k -= wr * kv[jdx]; fw_k -= wr * rhogw[jdx]; }
+                    }
+                }
+                if (fkv_k != 0.0 || prev_fkv != 0.0 || fw_k != 0.0 || prev_fw != 0.0) {
+                    kv[kdx]    -= (fkv_k - prev_fkv) * S.rdgzh[k];
+                    rhogw[kdx] -= (fw_k  - prev_fw)  * S.rdgzh[k];
+                }
+                prev_fkv = fkv_k; prev_fw = fw_k;
+            }
+        });
+
+    // 2B. Pure-Kokkos Zero-vx/vy/vz Fubini Full-Level Sedimentation (+ L2-Coalesced Mode 3!)
+    //     LaunchBounds<64, 5> -> 0 B register spill!
+    Kokkos::parallel_for("km_precip_f",
+        Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<64, 5>>(exec, 0, n2),
+        KOKKOS_LAMBDA(const size_t p) {
+            const WorkPtrs& W = *dW;
+            if (p >= W.wet_col_count[0]) return;
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS;
+            const uint32_t pc = W.wet_cols[p];
+            const int ij = (int)(pc & 0x3FFFFu), l = (int)(pc >> 18);
+            const size_t col = (size_t)l * ijdim + ij;
+            const uint32_t sp_mask = W.col_spmask[col];
+            const int k_hi = W.col_ktop[col];
+            const int sp_nq[4] = { P.i_qr, P.i_qi, P.i_qs, P.i_qg };
+            const double dt = P.dt, inv_dt = 1.0 / dt;
+            const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
+            const size_t offp = (size_t)l * 2ULL * (size_t)ijdim, offv = (size_t)l * 4ULL * s3;
+
+            double * __restrict__ rhog = S.rhog+off3, * __restrict__ rhogvx = S.rhogvx+off3;
+            double * __restrict__ rhogvy = S.rhogvy+off3, * __restrict__ rhogvz = S.rhogvz+off3;
+            double * __restrict__ rhoge = S.rhoge+off3, * __restrict__ rhogq = S.rhogq+off4;
+            const double * __restrict__ rhogw = S.rhogw+off3, * __restrict__ tem = S.tem+off3;
+            const double * __restrict__ z = S.z+off3, * __restrict__ zh = S.zh+off3;
+            const double * __restrict__ gs2 = S.gsgam2+off3, * __restrict__ gs2h = S.gsgam2h+off3, * __restrict__ g2 = S.gam2+off3;
+            const double * __restrict__ Vt = W.Vt+offv, * __restrict__ kv = W.kv+off3;
+            const double ix_c = S.ix[col], iy_c = S.iy[col], iz_c = S.iz[col];
+            const double jx_c = S.jx[col], jy_c = S.jy[col], jz_c = S.jz[col];
+
+            auto ez = [&](int k, int s) {
+                size_t idx = (size_t)ij + (size_t)k*ijdim;
+                double vt0  = Vt[idx + s*s3];
+                double vtm1 = (k > P.kmin0) ? Vt[idx - ijdim + s*s3] : vt0;
+                double wk   = (k == P.kmin0) ? vt0 : (S.afact[k]*vt0 + S.bfact[k]*vtm1);
+                if (wk == 0.0) return 0.0;
+                double wkp1 = (k < P.kmax0) ? (S.afact[k+1]*Vt[idx+ijdim+s*s3] + S.bfact[k+1]*vt0) : vt0;
+                double wkm1 = 0.0;
+                if (k > P.kmin0) wkm1 = (k - 1 == P.kmin0) ? vtm1 : (S.afact[k-1]*vtm1 + S.bfact[k-1]*Vt[idx-2ULL*ijdim+s*s3]);
+                double zhk = zh[idx], dzk = zh[idx+ijdim] - zhk, dzm1 = (k > P.kmin0) ? (zhk - zh[idx-ijdim]) : dzk;
+                return vadv1d_taylor_zdis(wk, wkp1, wkm1, dzk, dzm1, dzk + dzm1, dt, k == P.kmin0);
+            };
+
+            double* zd_c = (OPT_MODE == 3)
+                ? (W.zdis_m + ((p >> 6) * (size_t)kdim * 4ULL) * 64ULL + (p & 63ULL))
+                : nullptr;
+            if constexpr (OPT_MODE == 3) {
+                for (int s = 0; s < 4; ++s) {
+                    if (!(sp_mask & (1u << s))) continue;
+                    size_t idx_hi = (size_t)ij + (size_t)k_hi * ijdim;
+                    double vt_hi = Vt[idx_hi + s*s3];
+                    double vt_hip1 = (k_hi < P.kmax0) ? Vt[idx_hi + ijdim + s*s3] : vt_hi;
+                    double w_p1 = (k_hi < P.kmax0) ? (S.afact[k_hi+1]*vt_hip1 + S.bfact[k_hi+1]*vt_hi) : vt_hi;
+                    double vt_0 = vt_hi, vt_m1 = (k_hi > P.kmin0) ? Vt[idx_hi - ijdim + s*s3] : vt_hi;
+                    double w_0 = (k_hi == P.kmin0) ? vt_0 : (S.afact[k_hi]*vt_0 + S.bfact[k_hi]*vt_m1);
+                    double zh_p1 = zh[idx_hi + ijdim], zh_0 = zh[idx_hi], xi_next = zh_p1;
+                    for (int k = k_hi; k >= P.kmin0; --k) {
+                        size_t idx = (size_t)ij + (size_t)k * ijdim;
+                        double vt_m2 = (k - 1 > P.kmin0) ? Vt[idx - 2ULL*ijdim + s*s3] : vt_m1;
+                        double w_m1  = (k > P.kmin0) ? ((k-1 == P.kmin0) ? vt_m1 : (S.afact[k-1]*vt_m1 + S.bfact[k-1]*vt_m2)) : 0.0;
+                        double zh_m1 = (k > P.kmin0) ? zh[idx - ijdim] : zh_0;
+                        double d_raw = 0.0;
+                        if (w_0 != 0.0) {
+                            double dzk = zh_p1 - zh_0, dzm1 = (k > P.kmin0) ? (zh_0 - zh_m1) : dzk;
+                            d_raw = vadv1d_taylor_zdis(w_0, w_p1, w_m1, dzk, dzm1, dzk + dzm1, dt, k == P.kmin0);
+                        }
+                        double xi_k = zh_0 + d_raw;
+                        double xi_p = (xi_k < xi_next) ? xi_k : xi_next;
+                        double d_p  = xi_p - zh_0;
+                        zd_c[((size_t)k * 4ULL + (size_t)s) * 64ULL] = (d_p > 0.0) ? d_p : 0.0;
+                        xi_next = xi_p; w_p1 = w_0; w_0 = w_m1; vt_0 = vt_m1; vt_m1 = vt_m2; zh_p1 = zh_0; zh_0 = zh_m1;
+                    }
                 }
             }
-            if (c_max == ki) {
-                double rgs_j = g2[kdx] / gs2[kdx], W_tot = 0.0;
-                for (int s = 0; s < 4; ++s) if (kc[s] == ki) { double w_sj = rem[s] * rhogq[kdx + sp_nq[s]*s3] * rgs_j; fq[s] = -w_sj; W_tot += w_sj; }
-                if (W_tot != 0.0) {
-                    double rgj = rhog[kdx], rvx = rhogvx[kdx], rvy = rhogvy[kdx], rvz = rhogvz[kdx];
-                    double kh_r = 0.5*(rvx*rvx+rvy*rvy+rvz*rvz)/(rgj*rgj);
-                    fe = -P.CVdry*(W_tot*tem[kdx]); fp = -P.GRAV*(W_tot*z[kdx]); fk = -W_tot*kh_r;
-                    fu = -W_tot*(vx[kdx]*ix_c + vy[kdx]*iy_c + vz[kdx]*iz_c);
-                    fv = -W_tot*(vx[kdx]*jx_c + vy[kdx]*jy_c + vz[kdx]*jz_c);
-                }
-            } else if (c_max > ki) {
-                int j_end = (c_max <= k_hi) ? c_max : k_hi;
-                double feu = 0.0, fpu = 0.0;
-                for (int j = ki; j <= j_end; ++j) {
-                    size_t jdx = (size_t)ij + (size_t)j * ijdim;
-                    double dj = zh[jdx + ijdim] - zh[jdx], rgs_j = g2[jdx] / gs2[jdx], W_tot = 0.0;
-                    for (int s = 0; s < 4; ++s) {
-                        int c = kc[s]; if (c < j) continue;
-                        double L = (j < c) ? dj : rem[s];
-                        double w_sj = L * rhogq[jdx + sp_nq[s]*s3] * rgs_j;
-                        fq[s] -= w_sj; W_tot += w_sj;
+
+            auto eif = [&](int ki, double fq[4], double& fe, double& fp, double& fk, double& fu, double& fv) {
+                fq[0]=fq[1]=fq[2]=fq[3]=0; fe=fp=fk=fu=fv=0;
+                if (ki > k_hi) return;
+                size_t kdx = (size_t)ij + (size_t)ki*ijdim;
+                double zki = zh[kdx], zkp1 = zh[kdx + ijdim];
+                int kc[4] = { ki-1, ki-1, ki-1, ki-1 }, c_max = ki - 1;
+                double rem[4] = { 0, 0, 0, 0 };
+                for (int s = 0; s < 4; ++s) {
+                    if (!(sp_mask & (1u << s))) continue;
+                    double zdis = (OPT_MODE == 3) ? zd_c[((size_t)ki * 4ULL + (size_t)s) * 64ULL] : ez(ki, s);
+                    if (zdis <= 0.0) continue;
+                    double ztmp = zki + zdis;
+                    if (ztmp <= zkp1) { kc[s] = ki; rem[s] = zdis; if (ki > c_max) c_max = ki; }
+                    else {
+                        int c = ki; double zhc = zki;
+                        for (int j = ki + 1; j <= P.kmax0; ++j) {
+                            size_t jdx = (size_t)ij + (size_t)j * ijdim;
+                            if (ztmp <= zh[jdx + ijdim]) {
+                                double zj = zh[jdx]; if (ztmp > zj) { c = j; zhc = zj; } break;
+                            }
+                        }
+                        kc[s] = c; rem[s] = zdis - (zhc - zki);
+                        if (c > c_max) c_max = c;
                     }
+                }
+                if (c_max == ki) {
+                    double rgs_j = g2[kdx] / gs2[kdx], W_tot = 0.0;
+                    for (int s = 0; s < 4; ++s) if (kc[s] == ki) { double w_sj = rem[s] * rhogq[kdx + sp_nq[s]*s3] * rgs_j; fq[s] = -w_sj; W_tot += w_sj; }
                     if (W_tot != 0.0) {
-                        double rgj = rhog[jdx], rvx = rhogvx[jdx], rvy = rhogvy[jdx], rvz = rhogvz[jdx];
-                        double kh_r = 0.5*(rvx*rvx+rvy*rvy+rvz*rvz)/(rgj*rgj);
-                        feu -= W_tot * tem[jdx]; fpu -= W_tot * z[jdx]; fk -= W_tot * kh_r;
-                        fu -= W_tot * (vx[jdx]*ix_c + vy[jdx]*iy_c + vz[jdx]*iz_c);
-                        fv -= W_tot * (vx[jdx]*jx_c + vy[jdx]*jy_c + vz[jdx]*jz_c);
+                        double inv_rg = 1.0 / rhog[kdx];
+                        double vx_j = rhogvx[kdx]*inv_rg, vy_j = rhogvy[kdx]*inv_rg, vz_j = rhogvz[kdx]*inv_rg;
+                        double kh_r = 0.5*(vx_j*vx_j + vy_j*vy_j + vz_j*vz_j);
+                        fe = -P.CVdry*(W_tot*tem[kdx]); fp = -P.GRAV*(W_tot*z[kdx]); fk = -W_tot*kh_r;
+                        fu = -W_tot*(vx_j*ix_c + vy_j*iy_c + vz_j*iz_c);
+                        fv = -W_tot*(vx_j*jx_c + vy_j*jy_c + vz_j*jz_c);
+                    }
+                } else if (c_max > ki) {
+                    int j_end = (c_max <= k_hi) ? c_max : k_hi;
+                    double feu = 0.0, fpu = 0.0;
+                    for (int j = ki; j <= j_end; ++j) {
+                        size_t jdx = (size_t)ij + (size_t)j * ijdim;
+                        double dj = zh[jdx + ijdim] - zh[jdx], rgs_j = g2[jdx] / gs2[jdx], W_tot = 0.0;
+                        for (int s = 0; s < 4; ++s) {
+                            int c = kc[s]; if (c < j) continue;
+                            double L = (j < c) ? dj : rem[s];
+                            double w_sj = L * rhogq[jdx + sp_nq[s]*s3] * rgs_j;
+                            fq[s] -= w_sj; W_tot += w_sj;
+                        }
+                        if (W_tot != 0.0) {
+                            double inv_rg = 1.0 / rhog[jdx];
+                            double vx_j = rhogvx[jdx]*inv_rg, vy_j = rhogvy[jdx]*inv_rg, vz_j = rhogvz[jdx]*inv_rg;
+                            double kh_r = 0.5*(vx_j*vx_j + vy_j*vy_j + vz_j*vz_j);
+                            feu -= W_tot * tem[jdx]; fpu -= W_tot * z[jdx]; fk -= W_tot * kh_r;
+                            fu -= W_tot * (vx_j*ix_c + vy_j*iy_c + vz_j*iz_c);
+                            fv -= W_tot * (vx_j*jx_c + vy_j*jy_c + vz_j*jz_c);
+                        }
+                    }
+                    fe = P.CVdry * feu; fp = P.GRAV * fpu;
+                }
+            };
+
+            double fq_lo[4], fe_lo, fp_lo, fk_lo, fu_lo, fv_lo;
+            eif(P.kmin0, fq_lo, fe_lo, fp_lo, fk_lo, fu_lo, fv_lo);
+            S.precip[offp+ij] = -fq_lo[0]*inv_dt;
+            S.precip[offp+ij+ijdim] = -(fq_lo[1]+fq_lo[2]+fq_lo[3])*inv_dt;
+            S.precip_lh[col] = (fq_lo[1]+fq_lo[2]+fq_lo[3])*P.LHF*inv_dt;
+            S.precip_rhoein[col] = -fe_lo*inv_dt;
+            S.precip_rhophi[col] = -fp_lo*inv_dt;
+            S.precip_rhokin[col] = -fk_lo*inv_dt;
+            S.precip_energy[col] = S.precip_lh[col] + S.precip_rhoein[col] + S.precip_rhophi[col] + S.precip_rhokin[col];
+
+            double d_rg=0, d_rge=0, d_rkh_diff=0, d_kvp=0;
+            double gs2_m1 = gs2[(size_t)ij + (size_t)P.kmin0 * ijdim];
+            double inv_gs2_m1 = 1.0 / gs2_m1;
+            double inv_gs2h_m1 = 1.0 / gs2h[(size_t)ij + (size_t)P.kmin0 * ijdim];
+
+            for (int k = P.kmin0; k <= k_hi; ++k) {
+                double fq_hi[4], fe_hi, fp_hi, fk_hi, fu_hi, fv_hi;
+                eif(k+1, fq_hi, fe_hi, fp_hi, fk_hi, fu_hi, fv_hi);
+                size_t idx = (size_t)ij + (size_t)k*ijdim; double r = S.rdgz[k];
+                double dq0=-(fq_hi[0]-fq_lo[0])*r, dq1=-(fq_hi[1]-fq_lo[1])*r, dq2=-(fq_hi[2]-fq_lo[2])*r, dq3=-(fq_hi[3]-fq_lo[3])*r;
+                double sdq = dq0+dq1+dq2+dq3;
+                double drge = -(fe_hi-fe_lo)*r, drgp = -(fp_hi-fp_lo)*r, drgkh = -(fk_hi-fk_lo)*r;
+                double du = -(fu_hi-fu_lo)*r, dv = -(fv_hi-fv_lo)*r;
+                double rg_o = rhog[idx], rg_n = rg_o + sdq, rge_n = rhoge[idx], rkh_diff = 0.0;
+                if (sdq != 0.0 || du != 0.0 || dv != 0.0 || drgkh != 0.0 || drge != 0.0 || drgp != 0.0) {
+                    if (sdq != 0.0) { rhog[idx] = rg_n; rge_n += drge + drgp - sdq*P.GRAV*z[idx]; }
+                    else            { rge_n += drge + drgp; }
+                    if (sdq != 0.0 || du != 0.0 || dv != 0.0 || drgkh != 0.0) {
+                        double rvx_o = rhogvx[idx], rvy_o = rhogvy[idx], rvz_o = rhogvz[idx];
+                        double rkh_o = 0.5*(rvx_o*rvx_o+rvy_o*rvy_o+rvz_o*rvz_o)/rg_o;
+                        double rvx_n = rvx_o + du*ix_c + dv*jx_c, rvy_n = rvy_o + du*iy_c + dv*jy_c, rvz_n = rvz_o + du*iz_c + dv*jz_c;
+                        if (du != 0.0 || dv != 0.0) { rhogvx[idx]=rvx_n; rhogvy[idx]=rvy_n; rhogvz[idx]=rvz_n; }
+                        double rkh_n = 0.5*(rvx_n*rvx_n+rvy_n*rvy_n+rvz_n*rvz_n)/rg_n;
+                        rkh_diff = (rkh_o + drgkh) - rkh_n;
+                    }
+                    if (dq0 != 0.0) rhogq[idx+sp_nq[0]*s3]+=dq0;
+                    if (dq1 != 0.0) rhogq[idx+sp_nq[1]*s3]+=dq1;
+                    if (dq2 != 0.0) rhogq[idx+sp_nq[2]*s3]+=dq2;
+                    if (dq3 != 0.0) rhogq[idx+sp_nq[3]*s3]+=dq3;
+                }
+                double kvr = 0.0;
+                if (k > P.kmin0) {
+                    size_t im1 = idx - ijdim;
+                    double gs2_k = gs2[idx], gs2h_k = gs2h[idx];
+                    double inv_gs2_k = 1.0 / gs2_k, inv_gs2h_k = 1.0 / gs2h_k;
+                    double rw_n = rhogw[idx];
+                    if (rw_n != 0.0) {
+                        double rhogh_n = (S.afact[k]*inv_gs2_k*gs2h_k)*rg_n + (S.bfact[k]*inv_gs2_m1*gs2h_k)*d_rg;
+                        kvr = 0.5*rw_n*rw_n/rhogh_n;
+                    }
+                    double dv_k = (S.cfact[k-1]*kv[idx] + S.dfact[k-1]*kv[im1])
+                                - ((S.cfact[k-1]*gs2_m1*inv_gs2h_k)*kvr + (S.dfact[k-1]*gs2_m1*inv_gs2h_m1)*d_kvp);
+                    d_rge += d_rkh_diff + dv_k;
+                    rhoge[im1] = d_rge;
+                    gs2_m1 = gs2_k; inv_gs2_m1 = inv_gs2_k; inv_gs2h_m1 = inv_gs2h_k;
+                }
+                d_rg=rg_n; d_rge=rge_n; d_rkh_diff=rkh_diff; d_kvp=kvr;
+                for (int s=0;s<4;++s) fq_lo[s]=fq_hi[s]; fe_lo=fe_hi; fp_lo=fp_hi; fk_lo=fk_hi; fu_lo=fu_hi; fv_lo=fv_hi;
+            }
+            size_t idx = (size_t)ij + (size_t)k_hi * ijdim;
+            double gs2_k = gs2[idx];
+            if (k_hi < P.kmax0) {
+                size_t ip1 = idx + ijdim;
+                double gs2h_p1 = gs2h[ip1], kv_p1_t = kv[ip1];
+                double rhogh_p1 = (S.afact[k_hi+1]/gs2[ip1]*gs2h_p1)*rhog[ip1] + (S.bfact[k_hi+1]/gs2_k*gs2h_p1)*d_rg;
+                double rw_p1 = rhogw[ip1], kv_p1_n = 0.5*rw_p1*rw_p1/rhogh_p1;
+                double dv_k = (S.cfact[k_hi]*kv_p1_t + S.dfact[k_hi]*kv[idx])
+                            - ((S.cfact[k_hi]*gs2_k/gs2h_p1)*kv_p1_n + (S.dfact[k_hi]*gs2_k/gs2h[idx])*d_kvp);
+                rhoge[idx] = d_rge + d_rkh_diff + dv_k;
+                double gs2_p1 = gs2[ip1], kv_p2 = (k_hi + 1 < P.kmax0) ? kv[ip1 + ijdim] : 0.0;
+                double d_p1 = (S.cfact[k_hi+1]*(1.0 - gs2_p1/gs2h[ip1+ijdim]))*kv_p2 + S.dfact[k_hi+1]*(kv_p1_t - (gs2_p1/gs2h_p1)*kv_p1_n);
+                if (d_p1 != 0.0) rhoge[ip1] += d_p1;
+            } else {
+                double dv_k = S.dfact[P.kmax0]*kv[idx] - (S.dfact[P.kmax0]*gs2_k/gs2h[idx])*d_kvp;
+                rhoge[idx] = d_rge + d_rkh_diff + dv_k;
+            }
+        });
+
+    // 3. Pure-Kokkos 3D MDRangePolicy Clausius-Clapeyron Certified SatAdj+NF+Diag!
+    //    ZERO 64-bit integer divisions on all 13.31M cells; coalesced {128,1,1} ij tile!
+    using MDPolicySat = Kokkos::MDRangePolicy<
+        ExecSpace,
+        Kokkos::Rank<3, Kokkos::Iterate::Left, Kokkos::Iterate::Left>,
+        Kokkos::LaunchBounds<128, 4>>;
+    Kokkos::parallel_for("km_satadj_diag",
+        MDPolicySat(exec, {0, 0, 0}, {ijdim, kdim, lall}, {128, 1, 1}),
+        KOKKOS_LAMBDA(const int ij, const int k, const int l) {
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
+            const size_t idx  = (size_t)ij + (size_t)k * ijdim;
+            const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
+            const size_t col  = (size_t)l * ijdim + ij;
+
+            const int ktop = W.col_ktop[col];
+            const uint8_t* __restrict__ flg_a = W.cell_flag + off3;
+            const uint8_t flg = (k >= P.kmin0 && k <= P.kmax0) ? flg_a[idx] : (uint8_t)0u;
+            const bool above_precip = (ktop == 0 || k >= ktop + 2);
+
+            const double* __restrict__ gs2_a  = S.gsgam2  + off3;
+            const double* __restrict__ gs2h_a = S.gsgam2h + off3;
+            const double* __restrict__ kv_a   = W.kv      + off3;
+            double gs2 = gs2_a[idx], diff_e = 0.0;
+            bool rge_mod = false;
+            if (k >= P.kmin0 && k <= P.kmax0 && above_precip) {
+                double gs2h_k = gs2h_a[idx], gs2h_p1 = gs2h_a[idx+ijdim];
+                if (gs2 != gs2h_k || gs2 != gs2h_p1) {
+                    diff_e = (S.cfact[k]*(1.0 - gs2/gs2h_p1))*kv_a[idx+ijdim] + (S.dfact[k]*(1.0 - gs2/gs2h_k))*kv_a[idx];
+                    if (diff_e != 0.0) rge_mod = true;
+                }
+            }
+            if (flg == 2u && above_precip && !rge_mod) {
+                S.gdcfrc[off3+idx] = 0.0; S.gdclw[off3+idx] = P.UNDEF;
+                return;
+            }
+
+            double * __restrict__ rhog = S.rhog+off3, * __restrict__ rhoge = S.rhoge+off3, * __restrict__ rhogq = S.rhogq+off4;
+            double rg = rhog[idx], rge = rhoge[idx] + diff_e;
+
+            if (flg != 0u && above_precip) {
+                double rgqv = rhogq[idx+P.i_qv*s3];
+                double qv = (rgqv != 0.0) ? (rgqv / rg) : 0.0;
+                double rho_v = rg / gs2, tem0 = rge / (rg * P.CVdry);
+                bool cert = (flg == 2u && diff_e >= -0.1 * rg * P.CVdry && tem0 < 5000.0) || (qv <= 0.0);
+                bool supersat = false;
+                if (!cert) {
+                    double rtem00 = 1.0 / P.TEM00, inv_rho_Rv = 1.0 / (rho_v * P.Rvap);
+                    double tc0 = (tem0 > 10.0) ? tem0 : 10.0;
+                    double qsat = P.PSAT0 * exp(P.LovR_liq * (rtem00 - 1.0 / tc0)) * inv_rho_Rv / tem0;
+                    supersat = (qv - qsat > P.EPS);
+                }
+                if (!supersat) {
+                    if (rge_mod) {
+                        rhoge[idx] = rge;
+                        S.tem[off3+idx] = tem0;
+                        S.pre[off3+idx] = rho_v * ((1.0 - qv)*P.Rdry + qv*P.Rvap) * tem0;
+                    }
+                    S.gdcfrc[off3+idx] = 0.0; S.gdclw[off3+idx] = P.UNDEF;
+                    return;
+                }
+            }
+
+            double rgqv = rhogq[idx+P.i_qv*s3], rgqc = rhogq[idx+P.i_qc*s3], rgqr = rhogq[idx+P.i_qr*s3];
+            double rgqi = rhogq[idx+P.i_qi*s3], rgqs = rhogq[idx+P.i_qs*s3], rgqg = rhogq[idx+P.i_qg*s3];
+            double qv = (rgqv!=0.0)?(rgqv/rg):0.0, qc = (rgqc!=0.0)?(rgqc/rg):0.0, qr = (rgqr!=0.0)?(rgqr/rg):0.0;
+            double qi = (rgqi!=0.0)?(rgqi/rg):0.0, qs = (rgqs!=0.0)?(rgqs/rg):0.0, qg = (rgqg!=0.0)?(rgqg/rg):0.0;
+            double ein_m = rge / rg + qv * P.LHV, qsum = qv + qc, qv0 = qsum, qc0 = 0.0;
+            double rho_v = rg / gs2, tem0 = (ein_m - qv0 * P.LHV) / P.CVdry;
+            bool q_mod = (qc != 0.0);
+
+            if (k >= P.kmin0 && k <= P.kmax0 && qsum > 0.0) {
+                double rtem00 = 1.0 / P.TEM00, inv_rho_Rv = 1.0 / (rho_v * P.Rvap);
+                double tc0 = (tem0 > 10.0) ? tem0 : 10.0;
+                double qsat = P.PSAT0 * exp(P.LovR_liq * (rtem00 - 1.0 / tc0)) * inv_rho_Rv / tem0;
+                if (qsum - qsat > P.EPS) {
+                    q_mod = true;
+                    const double CV = P.CVdry, L = P.LHV, a = P.LovR_liq;
+                    for (int ite = 1; ite <= 20; ++ite) {
+                        if (ite > 1) {
+                            double tc = (tem0 > 10.0) ? tem0 : 10.0;
+                            qsat = P.PSAT0 * exp(a * (rtem00 - 1.0 / tc)) * inv_rho_Rv / tem0;
+                        }
+                        double rT = 1.0 / tem0, b = a * rT, Lq = L * qsat;
+                        double f  = CV * tem0 + Lq - ein_m;
+                        double f1 = CV + Lq * rT * (b - 1.0);
+                        double f2 = Lq * (rT * rT) * (b * b - 4.0 * b + 2.0);
+                        double f3 = Lq * (rT * rT * rT) * (b * (b * (b - 9.0) + 18.0) - 6.0);
+                        double dT_N = f / f1;
+                        double num  = f * (f1 * f1 - 0.5 * f * f2);
+                        double den  = f1 * (f1 * f1 - f * f2) + (1.0 / 6.0) * f * f * f3;
+                        double dT   = (den != 0.0) ? (num / den) : dT_N;
+                        if (!(dT * dT_N > 0.0 && fabs(dT) <= 2.0 * fabs(dT_N))) dT = dT_N;
+                        tem0 -= dT; if (tem0 < 10.0) tem0 = 10.0;
+                        if (fabs(dT) < 1.0e-12) {
+                            double qn = qsat + qsat * rT * (b - 1.0) * (-dT);
+                            qv0 = qn; qc0 = qsum - qn; break;
+                        }
                     }
                 }
-                fe = P.CVdry * feu; fp = P.GRAV * fpu;
             }
-        };
-
-        double fq_lo[4], fe_lo, fp_lo, fk_lo, fu_lo, fv_lo;
-        eif(P.kmin0, fq_lo, fe_lo, fp_lo, fk_lo, fu_lo, fv_lo);
-        S.precip[offp+ij] = -fq_lo[0]*inv_dt;
-        S.precip[offp+ij+ijdim] = -(fq_lo[1]+fq_lo[2]+fq_lo[3])*inv_dt;
-        S.precip_lh[col] = (fq_lo[1]+fq_lo[2]+fq_lo[3])*P.LHF*inv_dt;
-        S.precip_rhoein[col] = -fe_lo*inv_dt;
-        S.precip_rhophi[col] = -fp_lo*inv_dt;
-        S.precip_rhokin[col] = -fk_lo*inv_dt;
-        S.precip_energy[col] = S.precip_lh[col] + S.precip_rhoein[col] + S.precip_rhophi[col] + S.precip_rhokin[col];
-
-        double d_rg=0, d_rge=0, d_rkht=0, d_rkhn=0, d_kvp=0;
-        for (int k = P.kmin0; k <= k_hi; ++k) {
-            double fq_hi[4], fe_hi, fp_hi, fk_hi, fu_hi, fv_hi;
-            eif(k+1, fq_hi, fe_hi, fp_hi, fk_hi, fu_hi, fv_hi);
-            size_t idx = (size_t)ij + (size_t)k*ijdim; double r = S.rdgz[k];
-            double dq0=-(fq_hi[0]-fq_lo[0])*r, dq1=-(fq_hi[1]-fq_lo[1])*r, dq2=-(fq_hi[2]-fq_lo[2])*r, dq3=-(fq_hi[3]-fq_lo[3])*r;
-            double sdq = dq0+dq1+dq2+dq3;
-            double rg_o = rhog[idx], rvx_o = rhogvx[idx], rvy_o = rhogvy[idx], rvz_o = rhogvz[idx];
-            double rkh_o = 0.5*(rvx_o*rvx_o+rvy_o*rvy_o+rvz_o*rvz_o)/rg_o, rg_n = rg_o + sdq;
-            double du = -(fu_hi-fu_lo)*r, dv = -(fv_hi-fv_lo)*r;
-            double rvx_n = rvx_o + du*ix_c + dv*jx_c, rvy_n = rvy_o + du*iy_c + dv*jy_c, rvz_n = rvz_o + du*iz_c + dv*jz_c;
-            double rge_n = rhoge[idx] - (fe_hi-fe_lo)*r - (fp_hi-fp_lo)*r - sdq*P.GRAV*z[idx];
-            double rkh_t = rkh_o - (fk_hi-fk_lo)*r, rkh_n = 0.5*(rvx_n*rvx_n+rvy_n*rvy_n+rvz_n*rvz_n)/rg_n;
-            if (sdq != 0.0) rhog[idx] = rg_n;
-            if (du != 0.0 || dv != 0.0) { rhogvx[idx]=rvx_n; rhogvy[idx]=rvy_n; rhogvz[idx]=rvz_n; }
-            if (dq0 != 0.0) rhogq[idx+sp_nq[0]*s3]+=dq0;
-            if (dq1 != 0.0) rhogq[idx+sp_nq[1]*s3]+=dq1;
-            if (dq2 != 0.0) rhogq[idx+sp_nq[2]*s3]+=dq2;
-            if (dq3 != 0.0) rhogq[idx+sp_nq[3]*s3]+=dq3;
-            double kvr = 0.0;
-            if (k > P.kmin0) {
-                size_t im1 = idx - ijdim;
-                double rhogh_n = (S.afact[k]/gs2[idx]*gs2h[idx])*rg_n + (S.bfact[k]/gs2[im1]*gs2h[idx])*d_rg;
-                kvr = 0.5*rhogw[idx]*rhogw[idx]/rhogh_n;
-                double t2 = d_rkht + (S.cfact[k-1]*kv[idx] + S.dfact[k-1]*kv[im1]);
-                double t1 = d_rkhn + ((S.cfact[k-1]*gs2[im1]/gs2h[idx])*kvr + (S.dfact[k-1]*gs2[im1]/gs2h[im1])*d_kvp);
-                d_rge += (t2 - t1);
-                rhoge[im1] = d_rge;
+            if (k < P.kmin0 || k > P.kmax0) {
+                rhogq[idx+P.i_qv*s3] = rg*qv0; rhogq[idx+P.i_qc*s3] = rg*qc0;
+                rhoge[idx] = rg * tem0 * P.CVdry; S.rho[off3+idx] = rho_v;
+                for (int n=0;n<6;++n) S.q[off4+idx+n*s3] = 0.0;
+                S.gdcfrc[off3+idx] = 0.0; S.gdclw[off3+idx] = P.UNDEF;
+                return;
             }
-            d_rg=rg_n; d_rge=rge_n; d_rkht=rkh_t; d_rkhn=rkh_n; d_kvp=kvr;
-            for (int s=0;s<4;++s) fq_lo[s]=fq_hi[s]; fe_lo=fe_hi; fp_lo=fp_hi; fk_lo=fk_hi; fu_lo=fu_hi; fv_lo=fv_hi;
-        }
-        size_t idx = (size_t)ij + (size_t)k_hi * ijdim;
-        double gs2_k = gs2[idx];
-        if (k_hi < P.kmax0) {
-            size_t ip1 = idx + ijdim;
-            double gs2h_p1 = gs2h[ip1], kv_p1_t = kv[ip1];
-            double rhogh_p1 = (S.afact[k_hi+1]/gs2[ip1]*gs2h_p1)*rhog[ip1] + (S.bfact[k_hi+1]/gs2_k*gs2h_p1)*d_rg;
-            double rw_p1 = rhogw[ip1], kv_p1_n = 0.5*rw_p1*rw_p1/rhogh_p1;
-            double t2 = d_rkht + (S.cfact[k_hi]*kv_p1_t + S.dfact[k_hi]*kv[idx]);
-            double t1 = d_rkhn + ((S.cfact[k_hi]*gs2_k/gs2h_p1)*kv_p1_n + (S.dfact[k_hi]*gs2_k/gs2h[idx])*d_kvp);
-            rhoge[idx] = d_rge + (t2 - t1);
-            double gs2_p1 = gs2[ip1], kv_p2 = (k_hi + 1 < P.kmax0) ? kv[ip1 + ijdim] : 0.0;
-            double d_p1 = (S.cfact[k_hi+1]*(1.0 - gs2_p1/gs2h[ip1+ijdim]))*kv_p2 + S.dfact[k_hi+1]*(kv_p1_t - (gs2_p1/gs2h_p1)*kv_p1_n);
-            if (d_p1 != 0.0) rhoge[ip1] += d_p1;
-        } else {
-            rhoge[idx] = d_rge + (d_rkht + S.dfact[P.kmax0]*kv[idx]) - (d_rkhn + (S.dfact[P.kmax0]*gs2_k/gs2h[idx])*d_kvp);
-        }
+            if (q_mod) { rgqv = rg*qv0; rgqc = rg*qc0; }
+            double diffq = 0.0; bool neg = false;
+            auto cq = [&](double& v){ if (v < 0.0) { diffq += v; v = 0.0; neg = true; } };
+            cq(rgqc); cq(rgqr); cq(rgqi); cq(rgqs); cq(rgqg);
+            rgqv += diffq; double diff0 = 0.0;
+            if (rgqv < 0.0) { diff0 = rgqv; rgqv = 0.0; neg = true; }
+            if (neg) {
+                rg *= (1.0 - diff0); rho_v = rg / gs2; rhog[idx] = rg;
+                rhogq[idx+P.i_qv*s3]=rgqv; rhogq[idx+P.i_qc*s3]=rgqc; rhogq[idx+P.i_qr*s3]=rgqr;
+                rhogq[idx+P.i_qi*s3]=rgqi; rhogq[idx+P.i_qs*s3]=rgqs; rhogq[idx+P.i_qg*s3]=rgqg;
+                qv=(rgqv!=0)?rgqv/rg:0; qc=(rgqc!=0)?rgqc/rg:0; qr=(rgqr!=0)?rgqr/rg:0;
+                qi=(rgqi!=0)?rgqi/rg:0; qs=(rgqs!=0)?rgqs/rg:0; qg=(rgqg!=0)?rgqg/rg:0;
+                if (diff0 != 0.0 && W.col_w_ktop[col] < P.kmax0) W.col_w_ktop[col] = P.kmax0;
+            } else if (q_mod) {
+                rhogq[idx+P.i_qv*s3]=rgqv; rhogq[idx+P.i_qc*s3]=rgqc; qv=qv0; qc=qc0;
+            }
+            if (rge_mod || q_mod || neg) rhoge[idx] = tem0 * rg * P.CVdry;
+            bool mass_dirty = (ktop > 0 && k <= ktop) || neg;
+            bool rge_dirty  = (ktop > 0 && k <= ktop + 1) || rge_mod || q_mod || neg;
+            if (mass_dirty) {
+                S.rho[off3+idx] = rho_v;
+                S.vx[off3+idx] = S.rhogvx[off3+idx]/rg; S.vy[off3+idx] = S.rhogvy[off3+idx]/rg; S.vz[off3+idx] = S.rhogvz[off3+idx]/rg;
+                S.q[off4+idx+P.i_qv*s3]=qv; S.q[off4+idx+P.i_qc*s3]=qc; S.q[off4+idx+P.i_qr*s3]=qr;
+                S.q[off4+idx+P.i_qi*s3]=qi; S.q[off4+idx+P.i_qs*s3]=qs; S.q[off4+idx+P.i_qg*s3]=qg;
+            } else if (q_mod) { S.q[off4+idx+P.i_qv*s3]=qv; S.q[off4+idx+P.i_qc*s3]=qc; }
+            if (rge_dirty) {
+                double qd = 1.0 - (qv+qc+qr+qi+qs+qg);
+                S.tem[off3+idx] = tem0; S.pre[off3+idx] = rho_v * (qd*P.Rdry + qv*P.Rvap) * tem0;
+            }
+            double qtot = qc+qr+qi+qs+qg;
+            S.gdcfrc[off3+idx] = (qtot >= 1.0e-10) ? 1.0 : 0.0;
+            S.gdclw[off3+idx]  = P.UNDEF;
+        });
+
+    // 4. Exact Unchanged-Cell Skip diag_w & boundary conditions
+    Kokkos::parallel_for("km_diag_w",
+        Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<256, 4>>(exec, 0, n3),
+        KOKKOS_LAMBDA(const size_t gid) {
+            const NSW6Params& P = *dP; const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
+            const int l = (int)(gid / s3);
+            const size_t idx = gid - (size_t)l * s3;
+            const int k = (int)(idx / (size_t)ijdim), ij = (int)(idx - (size_t)k * ijdim);
+            const size_t col = (size_t)l * ijdim + ij;
+            if (k >= P.kmin0 && k <= P.kmax0) {
+                int kt = W.col_ktop[col], wk = W.col_w_ktop[col], hi = (kt > wk) ? kt : wk;
+                if (hi == 0 || k > hi + 1) return;
+            }
+            const size_t off3 = (size_t)l * s3;
+            if (k <= P.kmin0 || k > P.kmax0) { S.w[off3 + idx] = 0.0; return; }
+            const double* __restrict__ rho_a = S.rho + off3;
+            double rhogh = (S.afact[k] * rho_a[idx] + S.bfact[k] * rho_a[idx - ijdim]) * S.gsgam2h[off3 + idx];
+            S.w[off3 + idx] = S.rhogw[off3 + idx] / rhogh;
+        });
+
+    Kokkos::parallel_for("km_bndcnd", Kokkos::RangePolicy<ExecSpace>(exec, 0, n2), KOKKOS_LAMBDA(const size_t col) {
+        const NSW6Params& P = *dP; const StatePtrs& S = *dS;
+        const int l = (int)(col / (size_t)ijdim), ij = (int)(col - (size_t)l * ijdim);
+        const size_t off3 = (size_t)l * s3;
+        const size_t idx_b  = (size_t)ij + (size_t)(P.kmin0 - 1) * ijdim;
+        const size_t idx_b1 = (size_t)ij + (size_t)P.kmin0 * ijdim;
+        const size_t idx_t  = (size_t)ij + (size_t)(P.kmax0 + 1) * ijdim;
+        const size_t idx_t1 = (size_t)ij + (size_t)P.kmax0 * ijdim;
+
+        double tb = S.tem[off3 + idx_b1];
+        double pb = S.pre[off3 + idx_b1] + S.rho[off3 + idx_b1] * (S.phi[off3 + idx_b1] - S.phi[off3 + idx_b]);
+        S.tem[off3 + idx_b] = tb; S.pre[off3 + idx_b] = pb; S.rho[off3 + idx_b] = pb / (P.Rdry * tb);
+        S.vx[off3 + idx_b] = S.vx[off3 + idx_b1]; S.vy[off3 + idx_b] = S.vy[off3 + idx_b1]; S.vz[off3 + idx_b] = S.vz[off3 + idx_b1];
+        S.w[off3 + idx_b] = 0.0;
+
+        double tt = S.tem[off3 + idx_t1];
+        double pt = S.pre[off3 + idx_t1] - S.rho[off3 + idx_t1] * (S.phi[off3 + idx_t] - S.phi[off3 + idx_t1]);
+        if (pt <= 0.0) pt = S.pre[off3 + idx_t1];
+        S.tem[off3 + idx_t] = tt; S.pre[off3 + idx_t] = pt; S.rho[off3 + idx_t] = pt / (P.Rdry * tt);
+        S.vx[off3 + idx_t] = S.vx[off3 + idx_t1]; S.vy[off3 + idx_t] = S.vy[off3 + idx_t1]; S.vz[off3 + idx_t] = S.vz[off3 + idx_t1];
+        S.w[off3 + idx_t] = 0.0;
     });
-
-    // 3. Pure-Kokkos Laguerre Householder-4 SatAdj + Post-NF + Conditional Diag
-    Kokkos::parallel_for("km_satadj_diag", Kokkos::RangePolicy<ExecSpace>(exec, 0, n3), KOKKOS_LAMBDA(const size_t gid) {
-        const NSW6Params& P = *dP; const StatePtrs& S = *dS; const WorkPtrs& W = *dW;
-        const int l = (int)(gid / s3);
-        const size_t idx = gid - (size_t)l * s3;
-        const int k = (int)(idx / (size_t)ijdim), ij = (int)(idx - (size_t)k * ijdim);
-        const size_t off3 = (size_t)l * s3, off4 = (size_t)l * 6ULL * s3;
-        double *rhog = S.rhog+off3, *rhoge = S.rhoge+off3, *rhogq = S.rhogq+off4;
-
-        double rg = rhog[idx], rge = rhoge[idx], gs2 = S.gsgam2[off3 + idx];
-        bool rge_mod = false;
-        int ktop = W.col_ktop[(size_t)l * ijdim + ij];
-        if (k >= P.kmin0 && k <= P.kmax0 && (ktop == 0 || k >= ktop + 2)) {
-            double gs2h_k = S.gsgam2h[off3+idx], gs2h_p1 = S.gsgam2h[off3+idx+ijdim];
-            if (gs2 != gs2h_k || gs2 != gs2h_p1) {
-                const double* kv = W.kv + off3;
-                double de = (S.cfact[k]*(1.0 - gs2/gs2h_p1))*kv[idx+ijdim] + (S.dfact[k]*(1.0 - gs2/gs2h_k))*kv[idx];
-                if (de != 0.0) { rge += de; rge_mod = true; }
-            }
-        }
-        double rgqv = rhogq[idx+P.i_qv*s3], rgqc = rhogq[idx+P.i_qc*s3], rgqr = rhogq[idx+P.i_qr*s3];
-        double rgqi = rhogq[idx+P.i_qi*s3], rgqs = rhogq[idx+P.i_qs*s3], rgqg = rhogq[idx+P.i_qg*s3];
-        double qv = (rgqv!=0.0)?(rgqv/rg):0.0, qc = (rgqc!=0.0)?(rgqc/rg):0.0, qr = (rgqr!=0.0)?(rgqr/rg):0.0;
-        double qi = (rgqi!=0.0)?(rgqi/rg):0.0, qs = (rgqs!=0.0)?(rgqs/rg):0.0, qg = (rgqg!=0.0)?(rgqg/rg):0.0;
-        double ein_m = rge / rg + qv * P.LHV, qsum = qv + qc, qv0 = qsum, qc0 = 0.0;
-        double rho_v = rg / gs2, tem0 = (ein_m - qv0 * P.LHV) / P.CVdry;
-        bool q_mod = (qc != 0.0);
-
-        if (k >= P.kmin0 && k <= P.kmax0 && qsum > 0.0) {
-            double rtem00 = 1.0 / P.TEM00, inv_rho_Rv = 1.0 / (rho_v * P.Rvap);
-            double tc0 = (tem0 > 10.0) ? tem0 : 10.0;
-            double qsat = P.PSAT0 * exp(P.LovR_liq * (rtem00 - 1.0 / tc0)) * inv_rho_Rv / tem0;
-            if (qsum - qsat > P.EPS) {
-                q_mod = true;
-                const double CV = P.CVdry, L = P.LHV, a = P.LovR_liq;
-                for (int ite = 1; ite <= 20; ++ite) {
-                    if (ite > 1) {
-                        double tc = (tem0 > 10.0) ? tem0 : 10.0;
-                        qsat = P.PSAT0 * exp(a * (rtem00 - 1.0 / tc)) * inv_rho_Rv / tem0;
-                    }
-                    double rT = 1.0 / tem0, b = a * rT, Lq = L * qsat;
-                    double f  = CV * tem0 + Lq - ein_m;
-                    double f1 = CV + Lq * rT * (b - 1.0);
-                    double f2 = Lq * (rT * rT) * (b * b - 4.0 * b + 2.0);
-                    double f3 = Lq * (rT * rT * rT) * (b * (b * (b - 9.0) + 18.0) - 6.0);
-                    double dT_N = f / f1;
-                    double num  = f * (f1 * f1 - 0.5 * f * f2);
-                    double den  = f1 * (f1 * f1 - f * f2) + (1.0 / 6.0) * f * f * f3;
-                    double dT   = (den != 0.0) ? (num / den) : dT_N;
-                    if (!(dT * dT_N > 0.0 && fabs(dT) <= 2.0 * fabs(dT_N))) dT = dT_N;
-                    tem0 -= dT; if (tem0 < 10.0) tem0 = 10.0;
-                    if (fabs(dT) < 1.0e-12) {
-                        double qn = qsat + qsat * rT * (b - 1.0) * (-dT);
-                        qv0 = qn; qc0 = qsum - qn; break;
-                    }
-                }
-            }
-        }
-        if (k < P.kmin0 || k > P.kmax0) {
-            rhogq[idx+P.i_qv*s3] = rg*qv0; rhogq[idx+P.i_qc*s3] = rg*qc0;
-            rhoge[idx] = rg * tem0 * P.CVdry; S.rho[off3+idx] = rho_v;
-            for (int n=0;n<6;++n) S.q[off4+idx+n*s3] = 0.0;
-            S.gdcfrc[off3+idx] = 0.0; S.gdclw[off3+idx] = P.UNDEF;
-            return;
-        }
-        if (q_mod) { rgqv = rg*qv0; rgqc = rg*qc0; }
-        double diffq = 0.0; bool neg = false;
-        auto cq = [&](double& v){ if (v < 0.0) { diffq += v; v = 0.0; neg = true; } };
-        cq(rgqc); cq(rgqr); cq(rgqi); cq(rgqs); cq(rgqg);
-        rgqv += diffq; double diff0 = 0.0;
-        if (rgqv < 0.0) { diff0 = rgqv; rgqv = 0.0; neg = true; }
-        if (neg) {
-            rg *= (1.0 - diff0); rho_v = rg / gs2; rhog[idx] = rg;
-            rhogq[idx+P.i_qv*s3]=rgqv; rhogq[idx+P.i_qc*s3]=rgqc; rhogq[idx+P.i_qr*s3]=rgqr;
-            rhogq[idx+P.i_qi*s3]=rgqi; rhogq[idx+P.i_qs*s3]=rgqs; rhogq[idx+P.i_qg*s3]=rgqg;
-            qv=(rgqv!=0)?rgqv/rg:0; qc=(rgqc!=0)?rgqc/rg:0; qr=(rgqr!=0)?rgqr/rg:0;
-            qi=(rgqi!=0)?rgqi/rg:0; qs=(rgqs!=0)?rgqs/rg:0; qg=(rgqg!=0)?rgqg/rg:0;
-        } else if (q_mod) {
-            rhogq[idx+P.i_qv*s3]=rgqv; rhogq[idx+P.i_qc*s3]=rgqc; qv=qv0; qc=qc0;
-        }
-        if (rge_mod || q_mod || neg) rhoge[idx] = tem0 * rg * P.CVdry;
-        bool mass_dirty = (ktop > 0 && k <= ktop) || neg;
-        bool rge_dirty  = (ktop > 0 && k <= ktop + 1) || rge_mod || q_mod || neg;
-        if (mass_dirty) {
-            S.rho[off3+idx] = rho_v;
-            S.vx[off3+idx] = S.rhogvx[off3+idx]/rg; S.vy[off3+idx] = S.rhogvy[off3+idx]/rg; S.vz[off3+idx] = S.rhogvz[off3+idx]/rg;
-            S.q[off4+idx+P.i_qv*s3]=qv; S.q[off4+idx+P.i_qc*s3]=qc; S.q[off4+idx+P.i_qr*s3]=qr;
-            S.q[off4+idx+P.i_qi*s3]=qi; S.q[off4+idx+P.i_qs*s3]=qs; S.q[off4+idx+P.i_qg*s3]=qg;
-        } else if (q_mod) { S.q[off4+idx+P.i_qv*s3]=qv; S.q[off4+idx+P.i_qc*s3]=qc; }
-        if (rge_dirty) {
-            double qd = 1.0 - (qv+qc+qr+qi+qs+qg);
-            S.tem[off3+idx] = tem0; S.pre[off3+idx] = rho_v * (qd*P.Rdry + qv*P.Rvap) * tem0;
-        }
-        double qtot = qc+qr+qi+qs+qg;
-        S.gdcfrc[off3+idx] = (qtot >= 1.0e-10) ? 1.0 : 0.0;
-        S.gdclw[off3+idx]  = P.UNDEF;
-    });
-
-    kokkos_diag_w_and_bndcnd(exec, dP, ijdim, kdim, lall, dS);
 }
 
 int main(int argc, char** argv) {

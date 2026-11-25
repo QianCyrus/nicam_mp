@@ -4,8 +4,9 @@
 // Production Hopper SM90a (NVIDIA GH200 / H200) Strict-IEEE FP64 CUDA C++
 // Operator Suite for NICAM NSW6 Cloud Microphysics (ANZIAM 2027).
 //
-// Backported directly from the validated, zero-spill Hopper SM90a v4.1 suite
-// (4.069 ms/step with rceff, 3.897 ms/step miniapp on H200, N_FAIL = 0).
+// Backported directly from the validated, zero-spill Hopper SM90a v5.3 suite
+// (3.608 ms/step w/ rceff, 3.473 ms/step no-rceff, 3.771 ms/step Monotone on
+// idle H200; N_FAIL = 0 across all 24 output arrays, 0 B register spill).
 // Called directly from Fortran mod_mp_opt_bridge.f90 via iso_c_binding on the
 // active OpenACC CUDA stream (acc_get_cuda_stream(1)) with ZERO host-device sync!
 // =============================================================================
@@ -14,10 +15,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include "nsw6_hopper_v4.cuh"
+#include "nsw6_hopper_v5.cuh"
 
 namespace {
-static HopperWorkspaceV3 g_ws;
+static HopperWorkspaceV5 g_ws;
 static bool g_grid_uploaded = false;
 static int  g_grid_kdim     = 0;
 static const double* g_last_rdgz = nullptr;
@@ -27,15 +28,15 @@ extern "C" {
 
 void nsw6_opt_reset_counters(void* stream_ptr) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (g_ws.d_cnt) {
-        cudaMemsetAsync(g_ws.d_cnt, 0, sizeof(NSW6Counters), stream);
+    if (g_ws.base.d_cnt) {
+        cudaMemsetAsync(g_ws.base.d_cnt, 0, sizeof(NSW6Counters), stream);
     }
 }
 
 void nsw6_opt_get_counters(NSW6Counters* out_cnt, void* stream_ptr) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (g_ws.d_cnt && out_cnt) {
-        cudaMemcpyAsync(out_cnt, g_ws.d_cnt, sizeof(NSW6Counters), cudaMemcpyDeviceToHost, stream);
+    if (g_ws.base.d_cnt && out_cnt) {
+        cudaMemcpyAsync(out_cnt, g_ws.base.d_cnt, sizeof(NSW6Counters), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
     }
 }
@@ -96,9 +97,12 @@ void nsw6_opt_driver_launch_batched(
     S.phi = phi; S.gam2 = gam2; S.gam2h = gam2h; S.gsgam2 = gsgam2; S.gsgam2h = gsgam2h;
     sm90_v4_upload_state_ptrs(S, stream);
 
-    // 3. Dispatch zero-spill Hopper SM90a v4.1 pipeline (Modes 1, 2, 3)
+    // 3. Dispatch zero-spill Hopper SM90a pipeline:
+    //    - Mode 1 (ENG baseline): v4.1
+    //    - Mode 2 (MATH exact) & Mode 3 (MONO conservative): v5.3
     for (int m = 0; m < P.mp_div_num; ++m) {
-        sm90_v4_launch_step(P, lall, S, g_ws, stream);
+        if (P.opt_mode >= 2) sm90_v5_launch_step(P, lall, S, g_ws, stream);
+        else                 sm90_v4_launch_step(P, lall, S, g_ws.base, stream);
     }
 }
 

@@ -544,23 +544,23 @@ NSW6_HD void satadjust_liq_cell(
 NSW6_HD void nsw6_pre_and_core_cell(
     const NSW6Params& P,
     int ij, int k,
-    double* rhog,
-    double* rhoge,
-    double* rhogq,      // [ij + k*ijdim + nq*stride3d]
-    double* rho,
-    double* tem,
-    double* pre,
-    double* q,          // [ij + k*ijdim + nq*stride3d]
-    const double* w,
-    const double* unccn,
-    const double* factor_n_aie,
-    const double* gsgam2,
-    double* Vt,         // [ij + k*ijdim + s*stride3d], s=0..3 -> qr,qi,qs,qg
-    int* cnt_dry,
-    int* cnt_snow,
-    int* cnt_exp,
-    int* cnt_pow,
-    int* cnt_log)
+    double* __restrict__ rhog,
+    double* __restrict__ rhoge,
+    double* __restrict__ rhogq,      // [ij + k*ijdim + nq*stride3d]
+    double* __restrict__ rho,
+    double* __restrict__ tem,
+    double* __restrict__ pre,
+    double* __restrict__ q,          // [ij + k*ijdim + nq*stride3d]
+    const double* __restrict__ w,
+    const double* __restrict__ unccn,
+    const double* __restrict__ factor_n_aie,
+    const double* __restrict__ gsgam2,
+    double* __restrict__ Vt,         // [ij + k*ijdim + s*stride3d], s=0..3 -> qr,qi,qs,qg
+    int* __restrict__ cnt_dry,
+    int* __restrict__ cnt_snow,
+    int* __restrict__ cnt_exp,
+    int* __restrict__ cnt_pow,
+    int* __restrict__ cnt_log)
 {
     const int ijdim = P.ijdim;
     const int s3    = ijdim * P.kdim;
@@ -611,10 +611,9 @@ NSW6_HD void nsw6_pre_and_core_cell(
     double rgqg = rhogq[idx + P.i_qg * s3];
 
     double diffq = 0.0;
+    bool clipped = false;
     auto clip_q = [&](double& v) {
-        double vc = (v > 0.0) ? v : 0.0;
-        diffq += (v - vc);
-        v = vc;
+        if (v < 0.0) { diffq += v; v = 0.0; clipped = true; }
     };
     clip_q(rgqc);
     clip_q(rgqr);
@@ -623,9 +622,8 @@ NSW6_HD void nsw6_pre_and_core_cell(
     clip_q(rgqg);
 
     rgqv += diffq;
-    double rgqv_c = (rgqv > 0.0) ? rgqv : 0.0;
-    double diff0  = rgqv - rgqv_c; // <= 0
-    rgqv = rgqv_c;
+    double diff0 = 0.0;
+    if (rgqv < 0.0) { diff0 = rgqv; rgqv = 0.0; clipped = true; }
 
     rg = rg * (1.0 - diff0);
     double dens = rg / gs2;
@@ -645,9 +643,16 @@ NSW6_HD void nsw6_pre_and_core_cell(
     double rge = temp * rg * cva;
     double prs = dens * (qd * P.Rdry + qv * P.Rvap) * temp;
 
-    rhog[idx] = rg;
-    rho[idx]  = dens;
-    pre[idx]  = prs;
+    if (P.opt_mode == 1) {
+        rhog[idx] = rg;
+        rho[idx]  = dens;
+        pre[idx]  = prs;
+    } else if (clipped) {
+        rhog[idx] = rg;
+        rho[idx]  = dens;
+    } else if (P.compute_rceff) {
+        rho[idx]  = dens;
+    }
 
     // Clamp for NSW6_CORE inputs (already >= 0 from negative_filter)
     double temc = temp - P.TEM00;
@@ -921,6 +926,7 @@ NSW6_HD void nsw6_pre_and_core_cell(
     double Ka  = P.Ka0 + P.dKa_dT * temc;
     double Kd  = (P.Kd0 + P.dKd_dT * temc) * P.PRE00 / prs;
     double NU  = (P.nu0 + P.dnu_dT * temc) * Rdens;
+    double rf_ov_NU = rho_fact / NU;
 
     double Glv = 1.0 / (P.LHV0 / (Ka * temp) * (P.LHV0 / (P.Rvap * temp) - 1.0)
                         + 1.0 / (Kd * dens * qsatl));
@@ -931,8 +937,9 @@ NSW6_HD void nsw6_pre_and_core_cell(
     double Gil = (Ka * temc) / P.LHF0;
 
     // Rain evaporation
-    double ventr = P.f1r * P.GAM_2 * RLMDr_2
-                 + P.f2r * sqrt(P.Cr * rho_fact / NU * RLMDr_5dr) * P.GAM_5dr_h;
+    double ventr = (P.opt_mode == 1 || RLMDr != 0.0)
+        ? (P.f1r * P.GAM_2 * RLMDr_2 + P.f2r * sqrt(P.Cr * rf_ov_NU * RLMDr_5dr) * P.GAM_5dr_h)
+        : 0.0;
     double Prevp = 2.0 * P.PI * Rdens * P.N0r * (1.0 - fmin(Sliq, 1.0)) * Glv * ventr;
 
     // Ice deposition / sublimation
@@ -986,7 +993,9 @@ NSW6_HD void nsw6_pre_and_core_cell(
     double Pimlt = (1.0 - iceflg) * qi * inv_dt;
 
     // Snow deposition / sublimation / melting
-    double vents = P.f1s * MOMs_1 + P.f2s * sqrt(P.Cs * rho_fact / NU) * MOMs_5ds_h;
+    double vents = (P.opt_mode == 1 || zerosw_s == 0.0)
+        ? (P.f1s * MOMs_1 + P.f2s * sqrt(P.Cs * rf_ov_NU) * MOMs_5ds_h)
+        : 0.0;
     double tmp_s = 2.0 * P.PI * Rdens * (Sice - 1.0) * Giv * vents;
     double flag_ss = step_lt0(w[idx] - P.CRIT_SCLW_W) * step_ge0(qc - 1.0e-6);
     double flags_s = 1.0 - (1.0 - step_lt0(qs - 1.0e-6)) * (1.0 - flag_ss);
@@ -996,8 +1005,9 @@ NSW6_HD void nsw6_pre_and_core_cell(
                         + P.CL * temc / P.LHF0 * (Psacw + Psacr), 0.0);
 
     // Graupel deposition / sublimation / melting / freezing
-    double ventg = P.f1g * P.GAM_2 * RLMDg_2
-                 + P.f2g * sqrt(P.Cg * rho_fact / NU * RLMDg_5dg) * P.GAM_5dg_h;
+    double ventg = (P.opt_mode == 1 || RLMDg != 0.0)
+        ? (P.f1g * P.GAM_2 * RLMDg_2 + P.f2g * sqrt(P.Cg * rf_ov_NU * RLMDg_5dg) * P.GAM_5dg_h)
+        : 0.0;
     double tmp_g = 2.0 * P.PI * Rdens * P.N0g * (Sice - 1.0) * Giv * ventg;
     double flags_g = 1.0 - (1.0 - step_lt0(qg - 1.0e-6)) * (1.0 - flag_ss);
     double Pgdep = (1.0 - P.sw_sr2020 * flags_g) * spsati * tmp_g;
