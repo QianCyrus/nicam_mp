@@ -20,6 +20,7 @@ work_opt/analysis/msg_*.pe*
 work_opt/nicam_mp/bin/*
 work_opt/nicam_mp/lib/*
 work_opt/nicam_mp/workspace/*
+work_opt/kokkos_bench/build*/
 
 # Profiling traces
 *.nsys-rep
